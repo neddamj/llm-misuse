@@ -1,0 +1,25 @@
+name: llm-misuse
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - numpy
+  - matplotlib
+  - pillow
+  - tqdm
+  - sympy
+  - reportlab
+  - pypdf
+  - pymupdf
+  - transformers
+  - datasets
+  - accelerate
+  - sentencepiece
+  - safetensors
+  - pip:
+      - ftfy
+      - regex
+      - git+https://github.com/openai/CLIP.git
