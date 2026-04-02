@@ -6,6 +6,8 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -56,11 +58,22 @@ TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 
 EPSILON = 64 / 255
 ALPHA = 1 / 1000
-STEPS = 2500
+STEPS = 1500
 ATTACK_IMAGE_SIZE = (400, 400)
 MODEL_INPUT_SIZE = 448
 MAX_NEW_TOKENS = 128
 CROSS_MODEL_SOFTMINIMAX_TEMPERATURE = 1.0
+USE_EOT = True
+EOT_TRAIN_SAMPLES = 4
+EOT_EVAL_SAMPLES = 1
+EOT_ROTATION_DEGREES = 5
+EOT_PERSPECTIVE_DISTORTION = 0.2
+EOT_CROP_SCALE = (0.8, 1.0)
+EOT_CROP_RATIO = (0.9, 1.1)
+EOT_COLOR_JITTER_BRIGHTNESS = 0.1
+EOT_COLOR_JITTER_CONTRAST = 0.1
+EOT_COLOR_JITTER_SATURATION = 0.1
+EOT_GAUSSIAN_NOISE_STD = 0.02
 
 RESULT_PREFIX = "qwen3vl_llava_gemma3_textgen_multi_gpu"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
@@ -90,6 +103,67 @@ def load_image_tensor(
     image = Image.open(image_path).convert("RGB")
     image = image.resize(image_size, Image.Resampling.BICUBIC)
     return transforms.ToTensor()(image).to(device).unsqueeze(0)
+
+
+def sample_camera_transform(image_tensor: torch.Tensor) -> torch.Tensor:
+    if image_tensor.ndim != 3:
+        raise ValueError("Expected image_tensor with shape (C, H, W).")
+
+    channels, height, width = image_tensor.shape
+    fill = [1.0] * channels
+
+    startpoints, endpoints = transforms.RandomPerspective.get_params(
+        width=width,
+        height=height,
+        distortion_scale=EOT_PERSPECTIVE_DISTORTION,
+    )
+    x = TF.perspective(
+        image_tensor,
+        startpoints=startpoints,
+        endpoints=endpoints,
+        interpolation=InterpolationMode.BILINEAR,
+        fill=fill,
+    )
+
+    top, left, crop_height, crop_width = transforms.RandomResizedCrop.get_params(
+        x,
+        scale=EOT_CROP_SCALE,
+        ratio=EOT_CROP_RATIO,
+    )
+    x = TF.resized_crop(
+        x,
+        top,
+        left,
+        crop_height,
+        crop_width,
+        size=[height, width],
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+
+    angle = float(torch.empty(1).uniform_(-EOT_ROTATION_DEGREES, EOT_ROTATION_DEGREES).item())
+    x = TF.rotate(
+        x,
+        angle=angle,
+        interpolation=InterpolationMode.BILINEAR,
+        fill=fill,
+    )
+
+    brightness_factor = 1.0 + float(
+        torch.empty(1).uniform_(-EOT_COLOR_JITTER_BRIGHTNESS, EOT_COLOR_JITTER_BRIGHTNESS).item()
+    )
+    contrast_factor = 1.0 + float(
+        torch.empty(1).uniform_(-EOT_COLOR_JITTER_CONTRAST, EOT_COLOR_JITTER_CONTRAST).item()
+    )
+    saturation_factor = 1.0 + float(
+        torch.empty(1).uniform_(-EOT_COLOR_JITTER_SATURATION, EOT_COLOR_JITTER_SATURATION).item()
+    )
+
+    x = TF.adjust_brightness(x, brightness_factor)
+    x = TF.adjust_contrast(x, contrast_factor)
+    x = TF.adjust_saturation(x, saturation_factor)
+    x = x + torch.randn_like(x) * EOT_GAUSSIAN_NOISE_STD
+    return torch.clamp(x, 0.0, 1.0)
 
 
 def resolve_model_family(requested_model_family: str, model_type: str) -> str:
@@ -232,6 +306,23 @@ def save_noise_visualization(delta: torch.Tensor, output_path: Path) -> None:
     transforms.ToPILImage()(noise).save(output_path)
 
 
+def summarize_loss_values(losses_by_key: dict[str, float]) -> tuple[str, float, float]:
+    if not losses_by_key:
+        raise ValueError("Expected at least one loss value.")
+
+    first_key = next(iter(losses_by_key))
+    worst_key = first_key
+    worst_loss = losses_by_key[first_key]
+    total_loss = 0.0
+    for key, loss in losses_by_key.items():
+        total_loss += loss
+        if loss > worst_loss:
+            worst_key = key
+            worst_loss = loss
+
+    return worst_key, worst_loss, total_loss / len(losses_by_key)
+
+
 def canonicalize_cuda_device(device_name: str) -> str:
     device = torch.device(device_name)
     if device.type != "cuda" or device.index is None:
@@ -252,6 +343,15 @@ def validate_config() -> None:
 
     if not TARGET_TEXTS or any(not isinstance(target_text, str) or not target_text for target_text in TARGET_TEXTS):
         raise ValueError("TARGET_TEXTS must be a non-empty list of non-empty strings.")
+
+    if CROSS_MODEL_SOFTMINIMAX_TEMPERATURE <= 0:
+        raise ValueError("CROSS_MODEL_SOFTMINIMAX_TEMPERATURE must be positive.")
+
+    if USE_EOT:
+        if EOT_TRAIN_SAMPLES <= 0:
+            raise ValueError("EOT_TRAIN_SAMPLES must be positive when USE_EOT is enabled.")
+        if EOT_EVAL_SAMPLES <= 0:
+            raise ValueError("EOT_EVAL_SAMPLES must be positive when USE_EOT is enabled.")
 
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires CUDA.")
@@ -733,6 +833,101 @@ def evaluate_workers(workers: list[dict], image_cpu: torch.Tensor) -> dict[str, 
     return results
 
 
+def attack_workers(
+    workers: list[dict],
+    image_cpu: torch.Tensor,
+) -> tuple[list[str], dict[str, float], list[torch.Tensor]]:
+    image_cpu = image_cpu.detach().cpu().contiguous()
+    for worker in workers:
+        worker["request_queue"].put({"command": "attack_step", "image": image_cpu})
+
+    step_results = {}
+    ordered_keys = []
+    gradients = []
+    for worker in workers:
+        message = receive_message(worker)
+        if message["type"] != "attack_step":
+            raise RuntimeError(
+                f"Expected attack_step result from {worker['model_spec']['key']}, got {message['type']!r}."
+            )
+        key = message["key"]
+        ordered_keys.append(key)
+        step_results[key] = message["loss"]
+        gradients.append(message["grad"])
+
+    return ordered_keys, step_results, gradients
+
+
+def compute_softminimax_aggregation(
+    ordered_keys: list[str],
+    step_results: dict[str, float],
+    gradients: list[torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, str, float, float]:
+    if not ordered_keys or not gradients:
+        raise RuntimeError("Expected at least one worker result for soft minimax aggregation.")
+
+    temperature = torch.tensor(
+        CROSS_MODEL_SOFTMINIMAX_TEMPERATURE,
+        device=device,
+        dtype=dtype,
+    )
+    losses = torch.tensor(
+        [step_results[key] for key in ordered_keys],
+        device=device,
+        dtype=dtype,
+    )
+    weights = torch.softmax(losses / temperature, dim=0)
+    stacked_grads = torch.stack(gradients, dim=0).to(device=device, dtype=dtype)
+    weight_shape = (len(ordered_keys),) + (1,) * (stacked_grads.ndim - 1)
+    aggregated_grad = (stacked_grads * weights.view(weight_shape)).sum(dim=0)
+
+    worst_index = int(torch.argmax(losses).item())
+    softminimax_loss = float(
+        (
+            temperature
+            * (
+                torch.logsumexp(losses / temperature, dim=0)
+                - losses.new_tensor(len(ordered_keys)).log()
+            )
+        ).item()
+    )
+    return aggregated_grad, ordered_keys[worst_index], float(losses[worst_index].item()), softminimax_loss
+
+
+def evaluate_workers_eot(
+    workers: list[dict],
+    image_cpu: torch.Tensor,
+    *,
+    num_samples: int,
+) -> dict:
+    loss_sums = {
+        model_spec["key"]: 0.0
+        for model_spec in MODEL_SPECS
+    }
+    for _ in range(num_samples):
+        with torch.no_grad():
+            transformed_image = sample_camera_transform(image_cpu.squeeze(0)).unsqueeze(0)
+        sample_results = evaluate_workers(workers, transformed_image)
+        for key, result in sample_results.items():
+            loss_sums[key] += result["loss"]
+
+    per_model_mean_losses = {
+        key: loss_sums[key] / num_samples
+        for key in loss_sums
+    }
+    worst_key, worst_loss, mean_loss = summarize_loss_values(per_model_mean_losses)
+    return {
+        "num_samples": num_samples,
+        "per_model_mean_losses": per_model_mean_losses,
+        "worst_key": worst_key,
+        "worst_loss": worst_loss,
+        "mean_loss": mean_loss,
+    }
+
+
 def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     delta = torch.zeros_like(x_clean, requires_grad=True)
     optimizer = torch.optim.AdamW([delta], lr=ALPHA, weight_decay=0.0)
@@ -740,67 +935,83 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
 
     for _ in progress:
         optimizer.zero_grad(set_to_none=True)
-        x_adv = torch.clamp(x_clean + delta, 0.0, 1.0).detach().cpu().contiguous()
+        if not USE_EOT:
+            x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
+            ordered_keys, step_results, gradients = attack_workers(workers, x_adv)
+            aggregated_grad, worst_key, worst_loss, softminimax_loss = compute_softminimax_aggregation(
+                ordered_keys,
+                step_results,
+                gradients,
+                device=delta.device,
+                dtype=delta.dtype,
+            )
+            delta.grad = aggregated_grad.detach()
+            optimizer.step()
+            with torch.no_grad():
+                delta.clamp_(-EPSILON, EPSILON)
+                delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
 
-        for worker in workers:
-            worker["request_queue"].put({"command": "attack_step", "image": x_adv})
+            _, _, mean_loss = summarize_loss_values(step_results)
+            progress.set_postfix(
+                {
+                    f"{key}_loss": f"{value:.4f}"
+                    for key, value in step_results.items()
+                }
+                | {
+                    "worst_model": worst_key,
+                    "worst_loss": f"{worst_loss:.4f}",
+                    "softminimax_loss": f"{softminimax_loss:.4f}",
+                    "mean_loss": f"{mean_loss:.4f}",
+                }
+            )
+            continue
 
-        step_results = {}
-        ordered_keys = []
-        gradients = []
-        for worker in workers:
-            message = receive_message(worker)
-            if message["type"] != "attack_step":
-                raise RuntimeError(
-                    f"Expected attack_step result from {worker['model_spec']['key']}, got {message['type']!r}."
-                )
-            key = message["key"]
-            loss = message["loss"]
-            step_results[key] = loss
-            ordered_keys.append(key)
-            gradients.append(message["grad"])
+        eot_loss_sums = {
+            model_spec["key"]: 0.0
+            for model_spec in MODEL_SPECS
+        }
+        eot_softminimax_loss = 0.0
+        for _ in range(EOT_TRAIN_SAMPLES):
+            x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
+            transformed_image = sample_camera_transform(x_adv.squeeze(0)).unsqueeze(0)
+            ordered_keys, step_results, gradients = attack_workers(workers, transformed_image)
+            aggregated_grad, _, _, sample_softminimax_loss = compute_softminimax_aggregation(
+                ordered_keys,
+                step_results,
+                gradients,
+                device=delta.device,
+                dtype=delta.dtype,
+            )
+            transformed_image.backward(aggregated_grad)
+            eot_softminimax_loss += sample_softminimax_loss
+            for key, loss in step_results.items():
+                eot_loss_sums[key] += loss
 
-        if not gradients:
-            raise RuntimeError("Expected at least one worker result for soft minimax aggregation.")
+        if delta.grad is None:
+            raise RuntimeError("Expected EoT gradients on the perturbation tensor.")
 
-        losses = torch.tensor(
-            [step_results[key] for key in ordered_keys],
-            device=delta.device,
-            dtype=delta.dtype,
-        )
-        weights = torch.softmax(losses / CROSS_MODEL_SOFTMINIMAX_TEMPERATURE, dim=0)
-        stacked_grads = torch.stack(gradients, dim=0)
-        delta.grad = (
-            stacked_grads * weights.view(-1, 1, 1, 1, 1)
-        ).sum(dim=0).detach()
+        delta.grad.div_(EOT_TRAIN_SAMPLES)
         optimizer.step()
         with torch.no_grad():
             delta.clamp_(-EPSILON, EPSILON)
             delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
 
-        worst_index = int(torch.argmax(losses).item())
-        worst_key = ordered_keys[worst_index]
-        worst_loss = float(losses[worst_index].item())
-        softminimax_loss = float(
-            (
-                CROSS_MODEL_SOFTMINIMAX_TEMPERATURE
-                * (
-                    torch.logsumexp(losses / CROSS_MODEL_SOFTMINIMAX_TEMPERATURE, dim=0)
-                    - losses.new_tensor(len(ordered_keys)).log()
-                )
-            ).item()
-        )
-        mean_loss = sum(step_results.values()) / len(step_results)
+        eot_step_results = {
+            key: eot_loss_sums[key] / EOT_TRAIN_SAMPLES
+            for key in eot_loss_sums
+        }
+        eot_worst_key, eot_worst_loss, eot_mean_loss = summarize_loss_values(eot_step_results)
+        eot_softminimax_loss /= EOT_TRAIN_SAMPLES
         progress.set_postfix(
             {
-                f"{key}_loss": f"{value:.4f}"
-                for key, value in step_results.items()
+                f"{key}_eot_loss": f"{value:.4f}"
+                for key, value in eot_step_results.items()
             }
             | {
-                "worst_model": worst_key,
-                "worst_loss": f"{worst_loss:.4f}",
-                "softminimax_loss": f"{softminimax_loss:.4f}",
-                "mean_loss": f"{mean_loss:.4f}",
+                "eot_worst_model": eot_worst_key,
+                "eot_worst_loss": f"{eot_worst_loss:.4f}",
+                "eot_softminimax_loss": f"{eot_softminimax_loss:.4f}",
+                "eot_mean_loss": f"{eot_mean_loss:.4f}",
             }
         )
 
@@ -810,31 +1021,39 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
 def build_report_lines(
     clean_results: dict[str, dict],
     adv_results: dict[str, dict],
+    *,
+    clean_eot_summary: dict | None = None,
+    adv_eot_summary: dict | None = None,
 ) -> list[str]:
-    mean_clean_loss = sum(result["loss"] for result in clean_results.values()) / len(clean_results)
-    mean_adv_loss = sum(result["loss"] for result in adv_results.values()) / len(adv_results)
-    worst_clean_key = None
-    worst_clean_loss = None
-    for key, result in clean_results.items():
-        loss = result["loss"]
-        if worst_clean_loss is None or loss > worst_clean_loss:
-            worst_clean_key = key
-            worst_clean_loss = loss
-
-    worst_adv_key = None
-    worst_adv_loss = None
-    for key, result in adv_results.items():
-        loss = result["loss"]
-        if worst_adv_loss is None or loss > worst_adv_loss:
-            worst_adv_key = key
-            worst_adv_loss = loss
-
+    clean_losses = {key: result["loss"] for key, result in clean_results.items()}
+    adv_losses = {key: result["loss"] for key, result in adv_results.items()}
+    worst_clean_key, worst_clean_loss, mean_clean_loss = summarize_loss_values(clean_losses)
+    worst_adv_key, worst_adv_loss, mean_adv_loss = summarize_loss_values(adv_losses)
     configured_target_texts = get_configured_target_texts()
 
     lines = [
         f"Prompt: {USER_PROMPT}",
         f"Target loss mode: {TARGET_LOSS_MODE}",
+        f"EoT enabled: {USE_EOT}",
     ]
+    if USE_EOT:
+        lines.extend(
+            [
+                f"EoT train samples: {EOT_TRAIN_SAMPLES}",
+                f"EoT evaluation samples: {EOT_EVAL_SAMPLES}",
+                (
+                    "EoT transforms: "
+                    f"rotation={EOT_ROTATION_DEGREES}, "
+                    f"perspective={EOT_PERSPECTIVE_DISTORTION}, "
+                    f"crop_scale={EOT_CROP_SCALE}, "
+                    f"crop_ratio={EOT_CROP_RATIO}, "
+                    f"brightness={EOT_COLOR_JITTER_BRIGHTNESS}, "
+                    f"contrast={EOT_COLOR_JITTER_CONTRAST}, "
+                    f"saturation={EOT_COLOR_JITTER_SATURATION}, "
+                    f"noise_std={EOT_GAUSSIAN_NOISE_STD}"
+                ),
+            ]
+        )
     if TARGET_LOSS_MODE == "standard_ce":
         lines.extend(
             [
@@ -862,6 +1081,28 @@ def build_report_lines(
             f"- {model_spec['key']}: {model_spec['model_name']} on {canonicalize_cuda_device(model_spec['device'])}"
         )
 
+    if USE_EOT and clean_eot_summary is not None and adv_eot_summary is not None:
+        lines.extend(
+            [
+                "",
+                (
+                    f"EoT worst-case clean target loss "
+                    f"({clean_eot_summary['num_samples']} samples): "
+                    f"{clean_eot_summary['worst_loss']:.6f}"
+                ),
+                f"EoT worst-case clean model: {clean_eot_summary['worst_key']}",
+                (
+                    f"EoT worst-case adversarial target loss "
+                    f"({adv_eot_summary['num_samples']} samples): "
+                    f"{adv_eot_summary['worst_loss']:.6f}"
+                ),
+                f"EoT worst-case adversarial model: {adv_eot_summary['worst_key']}",
+                "",
+                f"EoT mean clean target loss: {clean_eot_summary['mean_loss']:.6f}",
+                f"EoT mean adversarial target loss: {adv_eot_summary['mean_loss']:.6f}",
+            ]
+        )
+
     lines.extend(
         [
             "",
@@ -882,6 +1123,17 @@ def build_report_lines(
             [
                 f"{key} clean target loss: {clean_results[key]['loss']:.6f}",
                 f"{key} adversarial target loss: {adv_results[key]['loss']:.6f}",
+            ]
+        )
+        if USE_EOT and clean_eot_summary is not None and adv_eot_summary is not None:
+            lines.extend(
+                [
+                    f"{key} EoT mean clean target loss: {clean_eot_summary['per_model_mean_losses'][key]:.6f}",
+                    f"{key} EoT mean adversarial target loss: {adv_eot_summary['per_model_mean_losses'][key]:.6f}",
+                ]
+            )
+        lines.extend(
+            [
                 "",
                 f"{key} clean generation:",
                 clean_results[key]["generation"],
@@ -917,6 +1169,21 @@ def main() -> None:
         print("Target texts:")
         for target_text in configured_target_texts:
             print(f"- {target_text}")
+    print(f"EoT enabled: {USE_EOT}")
+    if USE_EOT:
+        print(f"EoT train samples: {EOT_TRAIN_SAMPLES}")
+        print(f"EoT evaluation samples: {EOT_EVAL_SAMPLES}")
+        print(
+            "[Info] EoT transforms: "
+            f"rotation={EOT_ROTATION_DEGREES}, "
+            f"perspective={EOT_PERSPECTIVE_DISTORTION}, "
+            f"crop_scale={EOT_CROP_SCALE}, "
+            f"crop_ratio={EOT_CROP_RATIO}, "
+            f"brightness={EOT_COLOR_JITTER_BRIGHTNESS}, "
+            f"contrast={EOT_COLOR_JITTER_CONTRAST}, "
+            f"saturation={EOT_COLOR_JITTER_SATURATION}, "
+            f"noise_std={EOT_GAUSSIAN_NOISE_STD}"
+        )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -929,35 +1196,65 @@ def main() -> None:
 
         print("[Info] Evaluating clean image...")
         clean_results = evaluate_workers(workers, x_clean)
+        clean_eot_summary = None
+        if USE_EOT:
+            print("[Info] Evaluating clean image under EoT...")
+            clean_eot_summary = evaluate_workers_eot(
+                workers,
+                x_clean,
+                num_samples=EOT_EVAL_SAMPLES,
+            )
 
-        print("[Info] Starting multi-GPU AdamW text-generation attack...")
+        if USE_EOT:
+            print("[Info] Starting multi-GPU AdamW text-generation attack with EoT...")
+        else:
+            print("[Info] Starting multi-GPU AdamW text-generation attack...")
         x_final, delta = run_attack(workers, x_clean)
 
         print("[Info] Evaluating adversarial image...")
         adv_results = evaluate_workers(workers, x_final)
+        adv_eot_summary = None
+        if USE_EOT:
+            print("[Info] Evaluating adversarial image under EoT...")
+            adv_eot_summary = evaluate_workers_eot(
+                workers,
+                x_final,
+                num_samples=EOT_EVAL_SAMPLES,
+            )
 
         transforms.ToPILImage()(x_final.squeeze(0).cpu()).save(OUTPUT_ADV_PATH)
         save_noise_visualization(delta, OUTPUT_NOISE_PATH)
-        OUTPUT_REPORT_PATH.write_text("\n".join(build_report_lines(clean_results, adv_results)))
+        OUTPUT_REPORT_PATH.write_text(
+            "\n".join(
+                build_report_lines(
+                    clean_results,
+                    adv_results,
+                    clean_eot_summary=clean_eot_summary,
+                    adv_eot_summary=adv_eot_summary,
+                )
+            )
+        )
 
-        mean_clean_loss = sum(result["loss"] for result in clean_results.values()) / len(clean_results)
-        mean_adv_loss = sum(result["loss"] for result in adv_results.values()) / len(adv_results)
-        worst_clean_key = None
-        worst_clean_loss = None
-        for key, result in clean_results.items():
-            loss = result["loss"]
-            if worst_clean_loss is None or loss > worst_clean_loss:
-                worst_clean_key = key
-                worst_clean_loss = loss
+        clean_losses = {key: result["loss"] for key, result in clean_results.items()}
+        adv_losses = {key: result["loss"] for key, result in adv_results.items()}
+        worst_clean_key, worst_clean_loss, mean_clean_loss = summarize_loss_values(clean_losses)
+        worst_adv_key, worst_adv_loss, mean_adv_loss = summarize_loss_values(adv_losses)
 
-        worst_adv_key = None
-        worst_adv_loss = None
-        for key, result in adv_results.items():
-            loss = result["loss"]
-            if worst_adv_loss is None or loss > worst_adv_loss:
-                worst_adv_key = key
-                worst_adv_loss = loss
-
+        if USE_EOT and clean_eot_summary is not None and adv_eot_summary is not None:
+            print(
+                f"[Info] EoT worst-case clean target loss "
+                f"({clean_eot_summary['num_samples']} samples): "
+                f"{clean_eot_summary['worst_loss']:.6f}"
+            )
+            print(f"[Info] EoT worst-case clean model: {clean_eot_summary['worst_key']}")
+            print(
+                f"[Info] EoT worst-case adversarial target loss "
+                f"({adv_eot_summary['num_samples']} samples): "
+                f"{adv_eot_summary['worst_loss']:.6f}"
+            )
+            print(f"[Info] EoT worst-case adversarial model: {adv_eot_summary['worst_key']}")
+            print(f"[Info] EoT mean clean target loss: {clean_eot_summary['mean_loss']:.6f}")
+            print(f"[Info] EoT mean adversarial target loss: {adv_eot_summary['mean_loss']:.6f}")
         print(f"[Info] Worst-case clean target loss: {worst_clean_loss:.6f}")
         print(f"[Info] Worst-case clean model: {worst_clean_key}")
         print(f"[Info] Worst-case adversarial target loss: {worst_adv_loss:.6f}")
@@ -968,6 +1265,15 @@ def main() -> None:
             key = model_spec["key"]
             print(f"[Info] {key} clean target loss: {clean_results[key]['loss']:.6f}")
             print(f"[Info] {key} adversarial target loss: {adv_results[key]['loss']:.6f}")
+            if USE_EOT and clean_eot_summary is not None and adv_eot_summary is not None:
+                print(
+                    f"[Info] {key} EoT mean clean target loss: "
+                    f"{clean_eot_summary['per_model_mean_losses'][key]:.6f}"
+                )
+                print(
+                    f"[Info] {key} EoT mean adversarial target loss: "
+                    f"{adv_eot_summary['per_model_mean_losses'][key]:.6f}"
+                )
 
         print(f"[Success] Saved adversarial image to {OUTPUT_ADV_PATH.resolve()}")
         print(f"[Success] Saved perturbation visualization to {OUTPUT_NOISE_PATH.resolve()}")
