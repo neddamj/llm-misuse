@@ -55,11 +55,12 @@ TARGET_TEXTS: list[str] = [
 TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 
 EPSILON = 64 / 255
-ALPHA = 1 / 255
-STEPS = 2000
+ALPHA = 1 / 1000
+STEPS = 2500
 ATTACK_IMAGE_SIZE = (400, 400)
 MODEL_INPUT_SIZE = 448
 MAX_NEW_TOKENS = 128
+CROSS_MODEL_SOFTMINIMAX_TEMPERATURE = 1.0
 
 RESULT_PREFIX = "qwen3vl_llava_gemma3_textgen_multi_gpu"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
@@ -745,6 +746,7 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
             worker["request_queue"].put({"command": "attack_step", "image": x_adv})
 
         step_results = {}
+        ordered_keys = []
         gradients = []
         for worker in workers:
             message = receive_message(worker)
@@ -752,23 +754,54 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
                 raise RuntimeError(
                     f"Expected attack_step result from {worker['model_spec']['key']}, got {message['type']!r}."
                 )
-            step_results[message["key"]] = message["loss"]
+            key = message["key"]
+            loss = message["loss"]
+            step_results[key] = loss
+            ordered_keys.append(key)
             gradients.append(message["grad"])
 
-        mean_grad = torch.stack(gradients, dim=0).mean(dim=0)
-        delta.grad = mean_grad.detach()
+        if not gradients:
+            raise RuntimeError("Expected at least one worker result for soft minimax aggregation.")
+
+        losses = torch.tensor(
+            [step_results[key] for key in ordered_keys],
+            device=delta.device,
+            dtype=delta.dtype,
+        )
+        weights = torch.softmax(losses / CROSS_MODEL_SOFTMINIMAX_TEMPERATURE, dim=0)
+        stacked_grads = torch.stack(gradients, dim=0)
+        delta.grad = (
+            stacked_grads * weights.view(-1, 1, 1, 1, 1)
+        ).sum(dim=0).detach()
         optimizer.step()
         with torch.no_grad():
             delta.clamp_(-EPSILON, EPSILON)
             delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
 
+        worst_index = int(torch.argmax(losses).item())
+        worst_key = ordered_keys[worst_index]
+        worst_loss = float(losses[worst_index].item())
+        softminimax_loss = float(
+            (
+                CROSS_MODEL_SOFTMINIMAX_TEMPERATURE
+                * (
+                    torch.logsumexp(losses / CROSS_MODEL_SOFTMINIMAX_TEMPERATURE, dim=0)
+                    - losses.new_tensor(len(ordered_keys)).log()
+                )
+            ).item()
+        )
         mean_loss = sum(step_results.values()) / len(step_results)
         progress.set_postfix(
             {
                 f"{key}_loss": f"{value:.4f}"
                 for key, value in step_results.items()
             }
-            | {"mean_loss": f"{mean_loss:.4f}"}
+            | {
+                "worst_model": worst_key,
+                "worst_loss": f"{worst_loss:.4f}",
+                "softminimax_loss": f"{softminimax_loss:.4f}",
+                "mean_loss": f"{mean_loss:.4f}",
+            }
         )
 
     return torch.clamp(x_clean + delta, 0.0, 1.0).detach(), delta.detach()
@@ -780,6 +813,22 @@ def build_report_lines(
 ) -> list[str]:
     mean_clean_loss = sum(result["loss"] for result in clean_results.values()) / len(clean_results)
     mean_adv_loss = sum(result["loss"] for result in adv_results.values()) / len(adv_results)
+    worst_clean_key = None
+    worst_clean_loss = None
+    for key, result in clean_results.items():
+        loss = result["loss"]
+        if worst_clean_loss is None or loss > worst_clean_loss:
+            worst_clean_key = key
+            worst_clean_loss = loss
+
+    worst_adv_key = None
+    worst_adv_loss = None
+    for key, result in adv_results.items():
+        loss = result["loss"]
+        if worst_adv_loss is None or loss > worst_adv_loss:
+            worst_adv_key = key
+            worst_adv_loss = loss
+
     configured_target_texts = get_configured_target_texts()
 
     lines = [
@@ -815,6 +864,11 @@ def build_report_lines(
 
     lines.extend(
         [
+            "",
+            f"Worst-case clean target loss: {worst_clean_loss:.6f}",
+            f"Worst-case clean model: {worst_clean_key}",
+            f"Worst-case adversarial target loss: {worst_adv_loss:.6f}",
+            f"Worst-case adversarial model: {worst_adv_key}",
             "",
             f"Mean clean target loss: {mean_clean_loss:.6f}",
             f"Mean adversarial target loss: {mean_adv_loss:.6f}",
@@ -888,7 +942,26 @@ def main() -> None:
 
         mean_clean_loss = sum(result["loss"] for result in clean_results.values()) / len(clean_results)
         mean_adv_loss = sum(result["loss"] for result in adv_results.values()) / len(adv_results)
+        worst_clean_key = None
+        worst_clean_loss = None
+        for key, result in clean_results.items():
+            loss = result["loss"]
+            if worst_clean_loss is None or loss > worst_clean_loss:
+                worst_clean_key = key
+                worst_clean_loss = loss
 
+        worst_adv_key = None
+        worst_adv_loss = None
+        for key, result in adv_results.items():
+            loss = result["loss"]
+            if worst_adv_loss is None or loss > worst_adv_loss:
+                worst_adv_key = key
+                worst_adv_loss = loss
+
+        print(f"[Info] Worst-case clean target loss: {worst_clean_loss:.6f}")
+        print(f"[Info] Worst-case clean model: {worst_clean_key}")
+        print(f"[Info] Worst-case adversarial target loss: {worst_adv_loss:.6f}")
+        print(f"[Info] Worst-case adversarial model: {worst_adv_key}")
         print(f"[Info] Mean clean target loss: {mean_clean_loss:.6f}")
         print(f"[Info] Mean adversarial target loss: {mean_adv_loss:.6f}")
         for model_spec in MODEL_SPECS:
