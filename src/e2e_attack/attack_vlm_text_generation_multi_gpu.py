@@ -26,8 +26,8 @@ RESULTS_DIR = REPO_ROOT / "results"
 
 MODEL_SPECS = [
     {
-        "key": "qwen25vl",
-        "model_name": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "key": "qwen3_vl",
+        "model_name": "Qwen/Qwen3-VL-4B-Instruct",
         "model_family": "auto",
         "device": "cuda:0",
     },
@@ -48,19 +48,20 @@ MODEL_SPECS = [
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / "worksheet_000002.png"
 USER_PROMPT = "Solve the math problems shown in the image. Show steps and give the final answers."
 TARGET_TEXTS: list[str] = [
-    "The image shows a toaster",
-    "A toaster is sitting on a clean kitchen counter.",
-    "Toaster.",
+    "I cannot help with that",
+    "No",
+    "I'm sorry, I cant answer that.",
 ]
+TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 
 EPSILON = 64 / 255
 ALPHA = 1 / 255
-STEPS = 4000
+STEPS = 2000
 ATTACK_IMAGE_SIZE = (400, 400)
 MODEL_INPUT_SIZE = 448
 MAX_NEW_TOKENS = 128
 
-RESULT_PREFIX = "qwen25vl_llava_gemma3_textgen_multi_gpu"
+RESULT_PREFIX = "qwen3vl_llava_gemma3_textgen_multi_gpu"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
 OUTPUT_NOISE_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_noise.png"
 OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_generations.txt"
@@ -72,10 +73,12 @@ SUPPORTED_MODEL_TYPES = {
     "gemma3": "gemma",
     "qwen2_vl": "qwen",
     "qwen2_5_vl": "qwen",
+    "qwen3_vl": "qwen",
     "llava": "llava",
 }
 
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
+SUPPORTED_TARGET_LOSS_MODES = {"multi_reference", "standard_ce"}
 
 
 def load_image_tensor(
@@ -239,6 +242,13 @@ def validate_config() -> None:
     if not SOURCE_IMAGE_PATH.exists():
         raise FileNotFoundError(f"Source image not found: {SOURCE_IMAGE_PATH}")
 
+    if TARGET_LOSS_MODE not in SUPPORTED_TARGET_LOSS_MODES:
+        supported_modes = ", ".join(sorted(SUPPORTED_TARGET_LOSS_MODES))
+        raise ValueError(
+            f"TARGET_LOSS_MODE must be one of: {supported_modes}. "
+            f"Got {TARGET_LOSS_MODE!r}."
+        )
+
     if not TARGET_TEXTS or any(not isinstance(target_text, str) or not target_text for target_text in TARGET_TEXTS):
         raise ValueError("TARGET_TEXTS must be a non-empty list of non-empty strings.")
 
@@ -353,6 +363,12 @@ def build_target_batches(
     return target_batches
 
 
+def get_configured_target_texts() -> list[str]:
+    if TARGET_LOSS_MODE == "standard_ce":
+        return [TARGET_TEXTS[0]]
+    return TARGET_TEXTS
+
+
 def load_worker_state(model_spec: dict) -> dict:
     device_name = canonicalize_cuda_device(model_spec["device"])
     device = torch.device(device_name)
@@ -444,6 +460,7 @@ def load_worker_state(model_spec: dict) -> dict:
         "prompt_model_inputs": prompt_model_inputs,
         "prompt_input_ids": prompt_input_ids,
         "target_batches": target_batches,
+        "target_loss_mode": TARGET_LOSS_MODE,
     }
 
 
@@ -511,6 +528,22 @@ def target_loss(
     *,
     backward: bool = False,
 ) -> torch.Tensor:
+    if state["target_loss_mode"] == "standard_ce":
+        target_batch = state["target_batches"][0]
+        with torch.no_grad():
+            loss = -target_score(state, target_batch, vision_inputs)
+
+        if not backward:
+            return loss
+
+        pixel_values_ref = vision_inputs["pixel_values"].detach().requires_grad_(True)
+        vision_inputs_ref = dict(vision_inputs)
+        vision_inputs_ref["pixel_values"] = pixel_values_ref
+        score = target_score(state, target_batch, vision_inputs_ref)
+        grad = torch.autograd.grad(-score, pixel_values_ref)[0]
+        vision_inputs["pixel_values"].backward(grad)
+        return loss
+
     with torch.no_grad():
         detached_scores = torch.stack(
             [target_score(state, target_batch, vision_inputs) for target_batch in state["target_batches"]]
@@ -700,10 +733,12 @@ def evaluate_workers(workers: list[dict], image_cpu: torch.Tensor) -> dict[str, 
 
 
 def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    delta = torch.zeros_like(x_clean)
+    delta = torch.zeros_like(x_clean, requires_grad=True)
+    optimizer = torch.optim.AdamW([delta], lr=ALPHA, weight_decay=0.0)
     progress = tqdm(range(STEPS))
 
     for _ in progress:
+        optimizer.zero_grad(set_to_none=True)
         x_adv = torch.clamp(x_clean + delta, 0.0, 1.0).detach().cpu().contiguous()
 
         for worker in workers:
@@ -721,9 +756,11 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
             gradients.append(message["grad"])
 
         mean_grad = torch.stack(gradients, dim=0).mean(dim=0)
-        delta -= ALPHA * mean_grad.sign()
-        delta.clamp_(-EPSILON, EPSILON)
-        delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
+        delta.grad = mean_grad.detach()
+        optimizer.step()
+        with torch.no_grad():
+            delta.clamp_(-EPSILON, EPSILON)
+            delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
 
         mean_loss = sum(step_results.values()) / len(step_results)
         progress.set_postfix(
@@ -734,7 +771,7 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
             | {"mean_loss": f"{mean_loss:.4f}"}
         )
 
-    return torch.clamp(x_clean + delta, 0.0, 1.0), delta
+    return torch.clamp(x_clean + delta, 0.0, 1.0).detach(), delta.detach()
 
 
 def build_report_lines(
@@ -743,14 +780,34 @@ def build_report_lines(
 ) -> list[str]:
     mean_clean_loss = sum(result["loss"] for result in clean_results.values()) / len(clean_results)
     mean_adv_loss = sum(result["loss"] for result in adv_results.values()) / len(adv_results)
+    configured_target_texts = get_configured_target_texts()
 
     lines = [
         f"Prompt: {USER_PROMPT}",
-        "Target texts:",
-        *[f"- {target_text}" for target_text in TARGET_TEXTS],
-        "",
-        "Models:",
+        f"Target loss mode: {TARGET_LOSS_MODE}",
     ]
+    if TARGET_LOSS_MODE == "standard_ce":
+        lines.extend(
+            [
+                f"Active target text: {configured_target_texts[0]}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Target texts:",
+                *[f"- {target_text}" for target_text in configured_target_texts],
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Models:",
+        ]
+    )
     for model_spec in MODEL_SPECS:
         lines.append(
             f"- {model_spec['key']}: {model_spec['model_name']} on {canonicalize_cuda_device(model_spec['device'])}"
@@ -795,11 +852,18 @@ def main() -> None:
     print(f"Results dir: {RESULTS_DIR}")
     print(f"Source image: {SOURCE_IMAGE_PATH}")
     print(f"Prompt: {USER_PROMPT}")
-    print("Target texts:")
-    for target_text in TARGET_TEXTS:
-        print(f"- {target_text}")
 
     validate_config()
+    configured_target_texts = get_configured_target_texts()
+
+    print(f"Target loss mode: {TARGET_LOSS_MODE}")
+    if TARGET_LOSS_MODE == "standard_ce":
+        print(f"Active target text: {configured_target_texts[0]}")
+    else:
+        print("Target texts:")
+        for target_text in configured_target_texts:
+            print(f"- {target_text}")
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     x_clean = load_image_tensor(SOURCE_IMAGE_PATH, torch.device("cpu"), ATTACK_IMAGE_SIZE)
@@ -812,7 +876,7 @@ def main() -> None:
         print("[Info] Evaluating clean image...")
         clean_results = evaluate_workers(workers, x_clean)
 
-        print("[Info] Starting multi-GPU PGD text-generation attack...")
+        print("[Info] Starting multi-GPU AdamW text-generation attack...")
         x_final, delta = run_attack(workers, x_clean)
 
         print("[Info] Evaluating adversarial image...")
