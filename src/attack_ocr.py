@@ -7,7 +7,6 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-
 MODEL_NAME = "prithivMLmods/Imgscope-OCR-2B-0527"
 SOURCE_IMAGE_PATH = Path("data/images/worksheet_000000.png")
 OCR_PROMPT = "Read all text in the image and output only the extracted text."
@@ -21,7 +20,6 @@ RESULT_PREFIX = "imgscope_ocr_pgd"
 MODEL_INPUT_SIZE = 448
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
 
-
 def find_repo_root(start: Path | None = None) -> Path:
     current = (start or Path(__file__).resolve()).resolve()
     for candidate in (current, *current.parents):
@@ -32,20 +30,17 @@ def find_repo_root(start: Path | None = None) -> Path:
         "Launch the script from this repository or one of its subdirectories."
     )
 
-
 REPO_ROOT = find_repo_root()
 RESULTS_DIR = REPO_ROOT / "results"
 SOURCE_IMAGE_PATH = REPO_ROOT / SOURCE_IMAGE_PATH
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
 OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_report.txt"
 
-
 def load_image_tensor(image_path: Path, device: torch.device) -> torch.Tensor:
     image = Image.open(image_path).convert("RGB")
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
     return tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
-
 
 def save_image_tensor(image_tensor: torch.Tensor, output_path: Path) -> None:
     image = image_tensor.squeeze(0).detach().cpu().clamp(0.0, 1.0)
@@ -57,7 +52,6 @@ def save_image_tensor(image_tensor: torch.Tensor, output_path: Path) -> None:
         .numpy()
     )
     Image.fromarray(array).save(output_path)
-
 
 def pack_for_qwen(
     image_tensor: torch.Tensor,
@@ -122,7 +116,6 @@ def pack_for_qwen(
     image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device=device, dtype=torch.long)
     return pixel_values, image_grid_thw
 
-
 def build_text_model_inputs(
     prompt_inputs: dict[str, torch.Tensor],
     device: torch.device,
@@ -136,7 +129,6 @@ def build_text_model_inputs(
         if token_type_ids is not None:
             model_inputs[token_type_key] = token_type_ids.to(device)
     return model_inputs
-
 
 def build_prompt_inputs(
     processor,
@@ -160,7 +152,6 @@ def build_prompt_inputs(
         return_tensors="pt",
     )
     return rendered_prompt, build_text_model_inputs(prompt_inputs, device)
-
 
 def build_teacher_forced_inputs(
     tokenizer,
@@ -196,7 +187,6 @@ def build_teacher_forced_inputs(
     labels[:, : prompt_model_inputs["input_ids"].shape[1]] = -100
     return full_model_inputs, labels
 
-
 def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
     pixel_values, image_grid_thw = pack_for_qwen(
         image_tensor,
@@ -213,7 +203,6 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
     }
-
 
 def generate_transcript(
     model,
@@ -235,7 +224,6 @@ def generate_transcript(
         clean_up_tokenization_spaces=False,
     )[0].strip()
 
-
 def transcription_loss(
     model,
     teacher_forced_inputs: dict[str, torch.Tensor],
@@ -251,13 +239,6 @@ def transcription_loss(
     )
     return outputs.loss
 
-
-def project_delta(delta: torch.Tensor, x_clean: torch.Tensor) -> None:
-    with torch.no_grad():
-        delta.clamp_(-EPSILON, EPSILON)
-        delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
-
-
 def run_pgd(
     model,
     teacher_forced_inputs: dict[str, torch.Tensor],
@@ -268,7 +249,8 @@ def run_pgd(
     delta = torch.zeros_like(x_clean, dtype=torch.float32)
     if RANDOM_START:
         delta.uniform_(-EPSILON, EPSILON)
-        project_delta(delta, x_clean)
+        delta.clamp_(-EPSILON, EPSILON)
+        delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
     delta.requires_grad_(True)
 
     saw_nonzero_grad = False
@@ -293,7 +275,8 @@ def run_pgd(
 
         with torch.no_grad():
             delta.add_(ALPHA * grad.sign())
-            project_delta(delta, x_clean)
+            delta.clamp_(-EPSILON, EPSILON)
+            delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
 
         last_loss = float(loss.item())
         last_grad_inf = grad_inf
@@ -304,7 +287,6 @@ def run_pgd(
 
     x_final = torch.clamp(x_clean + delta.detach(), 0.0, 1.0)
     return x_final, delta.detach(), last_loss, last_grad_inf
-
 
 def levenshtein_distance(left: str, right: str) -> int:
     if left == right:
@@ -324,7 +306,6 @@ def levenshtein_distance(left: str, right: str) -> int:
             current.append(min(insert_cost, delete_cost, replace_cost))
         previous = current
     return previous[-1]
-
 
 def build_report(
     clean_text: str,
@@ -362,7 +343,6 @@ def build_report(
         f"Adversarial image path: {OUTPUT_ADV_PATH.resolve()}",
     ]
     return "\n".join(lines)
-
 
 def main() -> None:
     if not SOURCE_IMAGE_PATH.exists():
@@ -467,7 +447,6 @@ def main() -> None:
     print(f"Perturbation L_inf: {linf_delta:.6f}")
     print(f"Saved adversarial image to {OUTPUT_ADV_PATH.resolve()}")
     print(f"Saved report to {OUTPUT_REPORT_PATH.resolve()}")
-
 
 if __name__ == "__main__":
     main()
