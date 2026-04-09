@@ -50,12 +50,13 @@ MODEL_SPECS = [
 
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / "worksheet_000002.png"
 USER_PROMPT = "Solve the math problems shown in the image. Show steps and give the final answers."
+ATTACK_MODE = "untargeted" # Options: "targeted", "untargeted"
 TARGET_TEXTS: list[str] = [
     "I cannot help with that",
     "No",
     "I'm sorry, I cant answer that.",
 ]
-TARGET_LOSS_MODE = "multi_reference" # Options: "standard_ce", "multi_reference"
+TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 CROSS_MODEL_OPTIMIZATION_MODE = "mean_ce" # Options: "mean_ce", "softminimax"
 
 EPSILON = 64 / 255
@@ -94,6 +95,7 @@ SUPPORTED_MODEL_TYPES = {
 }
 
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
+SUPPORTED_ATTACK_MODES = {"targeted", "untargeted"}
 SUPPORTED_TARGET_LOSS_MODES = {"multi_reference", "standard_ce"}
 SUPPORTED_CROSS_MODEL_OPTIMIZATION_MODES = {"mean_ce", "softminimax"}
 
@@ -317,9 +319,10 @@ def summarize_loss_values(losses_by_key: dict[str, float]) -> tuple[str, float, 
     worst_key = first_key
     worst_loss = losses_by_key[first_key]
     total_loss = 0.0
+    higher_is_worse = ATTACK_MODE == "targeted"
     for key, loss in losses_by_key.items():
         total_loss += loss
-        if loss > worst_loss:
+        if (higher_is_worse and loss > worst_loss) or (not higher_is_worse and loss < worst_loss):
             worst_key = key
             worst_loss = loss
 
@@ -337,7 +340,14 @@ def validate_config() -> None:
     if not SOURCE_IMAGE_PATH.exists():
         raise FileNotFoundError(f"Source image not found: {SOURCE_IMAGE_PATH}")
 
-    if TARGET_LOSS_MODE not in SUPPORTED_TARGET_LOSS_MODES:
+    if ATTACK_MODE not in SUPPORTED_ATTACK_MODES:
+        supported_modes = ", ".join(sorted(SUPPORTED_ATTACK_MODES))
+        raise ValueError(
+            f"ATTACK_MODE must be one of: {supported_modes}. "
+            f"Got {ATTACK_MODE!r}."
+        )
+
+    if ATTACK_MODE == "targeted" and TARGET_LOSS_MODE not in SUPPORTED_TARGET_LOSS_MODES:
         supported_modes = ", ".join(sorted(SUPPORTED_TARGET_LOSS_MODES))
         raise ValueError(
             f"TARGET_LOSS_MODE must be one of: {supported_modes}. "
@@ -351,7 +361,10 @@ def validate_config() -> None:
             f"Got {CROSS_MODEL_OPTIMIZATION_MODE!r}."
         )
 
-    if not TARGET_TEXTS or any(not isinstance(target_text, str) or not target_text for target_text in TARGET_TEXTS):
+    if ATTACK_MODE == "targeted" and (
+        not TARGET_TEXTS
+        or any(not isinstance(target_text, str) or not target_text for target_text in TARGET_TEXTS)
+    ):
         raise ValueError("TARGET_TEXTS must be a non-empty list of non-empty strings.")
 
     if (
@@ -432,45 +445,62 @@ def build_prompt_inputs(
     return rendered_prompt, build_text_model_inputs(prompt_inputs, device)
 
 
+def build_teacher_forced_batch(
+    tokenizer,
+    prompt_model_inputs: dict[str, torch.Tensor],
+    text: str,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    target_ids = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is not None and (target_ids.shape[1] == 0 or target_ids[0, -1].item() != eos_token_id):
+        target_ids = torch.cat([target_ids, torch.tensor([[eos_token_id]], device=device)], dim=1)
+
+    full_model_inputs = {
+        "input_ids": torch.cat([prompt_model_inputs["input_ids"], target_ids], dim=1),
+        "attention_mask": torch.cat([prompt_model_inputs["attention_mask"], torch.ones_like(target_ids)], dim=1),
+    }
+    for token_type_key in TOKEN_TYPE_INPUT_KEYS:
+        token_type_ids = prompt_model_inputs.get(token_type_key)
+        if token_type_ids is not None:
+            full_model_inputs[token_type_key] = torch.cat(
+                [
+                    token_type_ids,
+                    torch.zeros(
+                        target_ids.shape,
+                        device=device,
+                        dtype=token_type_ids.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+
+    labels = full_model_inputs["input_ids"].clone()
+    labels[:, : prompt_model_inputs["input_ids"].shape[1]] = -100
+    return {
+        "model_inputs": full_model_inputs,
+        "labels": labels,
+    }
+
+
 def build_target_batches(
     tokenizer,
     prompt_model_inputs: dict[str, torch.Tensor],
     target_texts: list[str],
     device: torch.device,
 ) -> list[dict]:
-    eos_token_id = tokenizer.eos_token_id
     target_batches = []
     for target_text in target_texts:
-        target_ids = tokenizer(target_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-        if eos_token_id is not None and (target_ids.shape[1] == 0 or target_ids[0, -1].item() != eos_token_id):
-            target_ids = torch.cat([target_ids, torch.tensor([[eos_token_id]], device=device)], dim=1)
-
-        full_model_inputs = {
-            "input_ids": torch.cat([prompt_model_inputs["input_ids"], target_ids], dim=1),
-            "attention_mask": torch.cat([prompt_model_inputs["attention_mask"], torch.ones_like(target_ids)], dim=1),
-        }
-        for token_type_key in TOKEN_TYPE_INPUT_KEYS:
-            token_type_ids = prompt_model_inputs.get(token_type_key)
-            if token_type_ids is not None:
-                full_model_inputs[token_type_key] = torch.cat(
-                    [
-                        token_type_ids,
-                        torch.zeros(
-                            target_ids.shape,
-                            device=device,
-                            dtype=token_type_ids.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-
-        labels = full_model_inputs["input_ids"].clone()
-        labels[:, : prompt_model_inputs["input_ids"].shape[1]] = -100
+        target_batch = build_teacher_forced_batch(
+            tokenizer,
+            prompt_model_inputs,
+            target_text,
+            device,
+        )
         target_batches.append(
             {
                 "target_text": target_text,
-                "model_inputs": full_model_inputs,
-                "labels": labels,
+                **target_batch,
             }
         )
 
@@ -478,6 +508,8 @@ def build_target_batches(
 
 
 def get_configured_target_texts() -> list[str]:
+    if ATTACK_MODE != "targeted":
+        return []
     if TARGET_LOSS_MODE == "standard_ce":
         return [TARGET_TEXTS[0]]
     return TARGET_TEXTS
@@ -550,11 +582,15 @@ def load_worker_state(model_spec: dict) -> dict:
         **prompt_processor_kwargs,
     )
     prompt_input_ids = prompt_model_inputs["input_ids"]
-    target_batches = build_target_batches(
-        processor.tokenizer,
-        prompt_model_inputs,
-        TARGET_TEXTS,
-        device,
+    target_batches = (
+        build_target_batches(
+            processor.tokenizer,
+            prompt_model_inputs,
+            TARGET_TEXTS,
+            device,
+        )
+        if ATTACK_MODE == "targeted"
+        else []
     )
 
     print(
@@ -574,7 +610,9 @@ def load_worker_state(model_spec: dict) -> dict:
         "prompt_model_inputs": prompt_model_inputs,
         "prompt_input_ids": prompt_input_ids,
         "target_batches": target_batches,
-        "target_loss_mode": TARGET_LOSS_MODE,
+        "target_loss_mode": TARGET_LOSS_MODE if ATTACK_MODE == "targeted" else None,
+        "attack_mode": ATTACK_MODE,
+        "untargeted_reference_batch": None,
     }
 
 
@@ -650,6 +688,18 @@ def compute_target_pixel_values_grad(
     return torch.autograd.grad(-score, pixel_values_ref)[0]
 
 
+def compute_untargeted_reference_pixel_values_grad(
+    state: dict,
+    reference_batch: dict,
+    vision_inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    pixel_values_ref = vision_inputs["pixel_values"].detach().requires_grad_(True)
+    vision_inputs_ref = dict(vision_inputs)
+    vision_inputs_ref["pixel_values"] = pixel_values_ref
+    score = target_score(state, reference_batch, vision_inputs_ref)
+    return torch.autograd.grad(score, pixel_values_ref)[0]
+
+
 def target_loss(
     state: dict,
     vision_inputs: dict[str, torch.Tensor],
@@ -695,6 +745,40 @@ def target_loss(
     return aggregate_loss
 
 
+def untargeted_reference_loss(
+    state: dict,
+    vision_inputs: dict[str, torch.Tensor],
+    *,
+    backward: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reference_batch = state["untargeted_reference_batch"]
+    if reference_batch is None:
+        raise RuntimeError("Untargeted mode requires a clean reference generation before evaluation or attack.")
+
+    with torch.no_grad():
+        metric_loss = -target_score(state, reference_batch, vision_inputs)
+        optimization_loss = -metric_loss
+
+    if not backward:
+        return metric_loss, optimization_loss
+
+    grad = compute_untargeted_reference_pixel_values_grad(state, reference_batch, vision_inputs)
+    vision_inputs["pixel_values"].backward(grad)
+    return metric_loss, optimization_loss
+
+
+def attack_loss(
+    state: dict,
+    vision_inputs: dict[str, torch.Tensor],
+    *,
+    backward: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if state["attack_mode"] == "targeted":
+        metric_loss = target_loss(state, vision_inputs, backward=backward)
+        return metric_loss, metric_loss
+    return untargeted_reference_loss(state, vision_inputs, backward=backward)
+
+
 def generate_from_image(state: dict, image_tensor: torch.Tensor) -> str:
     vision_inputs = build_vision_inputs(state, image_tensor)
     generated = state["model"].generate(
@@ -714,9 +798,12 @@ def generate_from_image(state: dict, image_tensor: torch.Tensor) -> str:
 def evaluate_image(state: dict, image_cpu: torch.Tensor) -> dict:
     image_gpu = image_cpu.to(state["device"], non_blocking=True).squeeze(0)
     with torch.no_grad():
-        vision_inputs = build_vision_inputs(state, image_gpu)
-        loss = float(target_loss(state, vision_inputs).item())
         generation = generate_from_image(state, image_gpu)
+        loss = None
+        if state["attack_mode"] == "targeted" or state["untargeted_reference_batch"] is not None:
+            vision_inputs = build_vision_inputs(state, image_gpu)
+            metric_loss, _ = attack_loss(state, vision_inputs)
+            loss = float(metric_loss.item())
     return {
         "loss": loss,
         "generation": generation,
@@ -726,11 +813,12 @@ def evaluate_image(state: dict, image_cpu: torch.Tensor) -> dict:
 def attack_step(state: dict, image_cpu: torch.Tensor) -> dict:
     x_adv = image_cpu.to(state["device"], non_blocking=True).detach().clone().requires_grad_(True)
     vision_inputs = build_vision_inputs(state, x_adv.squeeze(0))
-    loss = target_loss(state, vision_inputs, backward=True)
+    metric_loss, optimization_loss = attack_loss(state, vision_inputs, backward=True)
     if x_adv.grad is None:
         raise RuntimeError("Expected a gradient on the adversarial image tensor.")
     return {
-        "loss": float(loss.item()),
+        "loss": float(metric_loss.item()),
+        "optimization_loss": float(optimization_loss.item()),
         "grad": x_adv.grad.detach().cpu(),
     }
 
@@ -761,6 +849,23 @@ def worker_main(model_spec: dict, request_queue, response_queue) -> None:
             if command == "evaluate":
                 result = evaluate_image(state, message["image"])
                 response_queue.put({"type": "evaluate", "key": model_spec["key"], **result})
+                continue
+            if command == "set_untargeted_reference":
+                reference_text = message["reference_text"]
+                if not reference_text:
+                    raise RuntimeError(
+                        f"Untargeted mode requires a non-empty clean generation for {model_spec['key']}."
+                    )
+                state["untargeted_reference_batch"] = {
+                    "reference_text": reference_text,
+                    **build_teacher_forced_batch(
+                        state["processor"].tokenizer,
+                        state["prompt_model_inputs"],
+                        reference_text,
+                        state["device"],
+                    ),
+                }
+                response_queue.put({"type": "set_untargeted_reference", "key": model_spec["key"]})
                 continue
             raise ValueError(f"Unsupported command: {command!r}")
     except Exception:
@@ -871,18 +976,45 @@ def evaluate_workers(workers: list[dict], image_cpu: torch.Tensor) -> dict[str, 
 def attack_workers(
     workers: list[dict],
     image_cpu: torch.Tensor,
-) -> tuple[list[str], dict[str, float], list[torch.Tensor]]:
+) -> tuple[list[str], dict[str, float], dict[str, float], list[torch.Tensor]]:
     messages = dispatch_worker_command(workers, "attack_step", image_cpu, expected_type="attack_step")
     return (
         [message["key"] for message in messages],
         {message["key"]: message["loss"] for message in messages},
+        {message["key"]: message["optimization_loss"] for message in messages},
         [message["grad"] for message in messages],
     )
 
 
+def set_workers_untargeted_references(
+    workers: list[dict],
+    clean_results: dict[str, dict],
+) -> None:
+    for worker in workers:
+        key = worker["model_spec"]["key"]
+        reference_text = clean_results[key]["generation"]
+        if not reference_text:
+            raise RuntimeError(f"Untargeted mode requires a non-empty clean generation for {key}.")
+        worker["request_queue"].put(
+            {
+                "command": "set_untargeted_reference",
+                "reference_text": reference_text,
+            }
+        )
+
+    messages = [receive_message(worker) for worker in workers]
+    for worker, message in zip(workers, messages):
+        if message["type"] != "set_untargeted_reference":
+            raise RuntimeError(
+                f"Expected set_untargeted_reference result from {worker['model_spec']['key']}, "
+                f"got {message['type']!r}."
+            )
+
+
 def compute_cross_model_aggregation(
     ordered_keys: list[str],
-    step_results: dict[str, float],
+    metric_losses_by_key: dict[str, float],
+    optimization_losses_by_key: dict[str, float],
     gradients: list[torch.Tensor],
     *,
     device: torch.device,
@@ -891,13 +1023,18 @@ def compute_cross_model_aggregation(
     if not ordered_keys or not gradients:
         raise RuntimeError("Expected at least one worker result for cross-model aggregation.")
 
-    losses = torch.tensor(
-        [step_results[key] for key in ordered_keys],
+    metric_losses = torch.tensor(
+        [metric_losses_by_key[key] for key in ordered_keys],
+        device=device,
+        dtype=dtype,
+    )
+    optimization_losses = torch.tensor(
+        [optimization_losses_by_key[key] for key in ordered_keys],
         device=device,
         dtype=dtype,
     )
     stacked_grads = torch.stack(gradients, dim=0).to(device=device, dtype=dtype)
-    worst_index = int(torch.argmax(losses).item())
+    worst_index = int(torch.argmax(optimization_losses).item())
 
     if CROSS_MODEL_OPTIMIZATION_MODE == "softminimax":
         temperature = torch.tensor(
@@ -905,32 +1042,32 @@ def compute_cross_model_aggregation(
             device=device,
             dtype=dtype,
         )
-        weights = torch.softmax(losses / temperature, dim=0)
+        weights = torch.softmax(optimization_losses / temperature, dim=0)
         weight_shape = (len(ordered_keys),) + (1,) * (stacked_grads.ndim - 1)
         aggregated_grad = (stacked_grads * weights.view(weight_shape)).sum(dim=0)
         aggregate_loss = float(
             (
                 temperature
                 * (
-                    torch.logsumexp(losses / temperature, dim=0)
-                    - losses.new_tensor(len(ordered_keys)).log()
+                    torch.logsumexp(optimization_losses / temperature, dim=0)
+                    - optimization_losses.new_tensor(len(ordered_keys)).log()
                 )
             ).item()
         )
         return (
             aggregated_grad,
             ordered_keys[worst_index],
-            float(losses[worst_index].item()),
+            float(metric_losses[worst_index].item()),
             aggregate_loss,
         )
 
     if CROSS_MODEL_OPTIMIZATION_MODE == "mean_ce":
         aggregated_grad = stacked_grads.mean(dim=0)
-        aggregate_loss = float(losses.mean().item())
+        aggregate_loss = float(optimization_losses.mean().item())
         return (
             aggregated_grad,
             ordered_keys[worst_index],
-            float(losses[worst_index].item()),
+            float(metric_losses[worst_index].item()),
             aggregate_loss,
         )
 
@@ -979,16 +1116,23 @@ def build_progress_postfix(
     *,
     prefix: str = "",
 ) -> dict[str, str]:
+    aggregate_key = "aggregate_loss" if ATTACK_MODE == "targeted" else "aggregate_objective"
     postfix = {f"{key}_{prefix}loss": f"{value:.4f}" for key, value in losses_by_key.items()}
     postfix.update(
         {
             f"{prefix}worst_model": worst_key,
             f"{prefix}worst_loss": f"{worst_loss:.4f}",
-            f"{prefix}aggregate_loss": f"{aggregate_loss:.4f}",
+            f"{prefix}{aggregate_key}": f"{aggregate_loss:.4f}",
             f"{prefix}mean_loss": f"{mean_loss:.4f}",
         }
     )
     return postfix
+
+
+def get_metric_loss_label() -> str:
+    if ATTACK_MODE == "untargeted":
+        return "untargeted reference loss"
+    return "target loss"
 
 
 def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1000,10 +1144,11 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
         optimizer.zero_grad(set_to_none=True)
         if not USE_EOT:
             x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
-            ordered_keys, step_results, gradients = attack_workers(workers, x_adv)
+            ordered_keys, step_results, optimization_losses, gradients = attack_workers(workers, x_adv)
             aggregated_grad, worst_key, worst_loss, aggregate_loss = compute_cross_model_aggregation(
                 ordered_keys,
                 step_results,
+                optimization_losses,
                 gradients,
                 device=delta.device,
                 dtype=delta.dtype,
@@ -1029,10 +1174,11 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
         for _ in range(EOT_TRAIN_SAMPLES):
             x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
             transformed_image = sample_camera_transform(x_adv.squeeze(0)).unsqueeze(0)
-            ordered_keys, step_results, gradients = attack_workers(workers, transformed_image)
+            ordered_keys, step_results, optimization_losses, gradients = attack_workers(workers, transformed_image)
             aggregated_grad, _, _, sample_aggregate_loss = compute_cross_model_aggregation(
                 ordered_keys,
                 step_results,
+                optimization_losses,
                 gradients,
                 device=delta.device,
                 dtype=delta.dtype,
@@ -1071,7 +1217,13 @@ def build_target_config_lines(
     *,
     target_first: bool,
 ) -> list[str]:
-    target_lines = [f"Active target text: {configured_target_texts[0]}"] if TARGET_LOSS_MODE == "standard_ce" else ["Target texts:", *(f"- {target_text}" for target_text in configured_target_texts)]
+    target_lines: list[str]
+    if ATTACK_MODE == "untargeted":
+        target_lines = ["Untargeted reference source: each model's clean generation"]
+    elif TARGET_LOSS_MODE == "standard_ce":
+        target_lines = [f"Active target text: {configured_target_texts[0]}"]
+    else:
+        target_lines = ["Target texts:", *(f"- {target_text}" for target_text in configured_target_texts)]
     optimization_lines = [f"Cross-model optimization mode: {CROSS_MODEL_OPTIMIZATION_MODE}"]
     if CROSS_MODEL_OPTIMIZATION_MODE == "softminimax":
         optimization_lines.append(
@@ -1097,7 +1249,10 @@ def build_target_config_lines(
             ]
         )
     first, second = (target_lines, eot_lines) if target_first else (eot_lines, target_lines)
-    return [f"Target loss mode: {TARGET_LOSS_MODE}", *optimization_lines, *first, *second]
+    lines = [f"Attack mode: {ATTACK_MODE}"]
+    if ATTACK_MODE == "targeted":
+        lines.append(f"Target loss mode: {TARGET_LOSS_MODE}")
+    return [*lines, *optimization_lines, *first, *second]
 
 
 def build_aggregate_summary_sections(
@@ -1107,6 +1262,7 @@ def build_aggregate_summary_sections(
     clean_eot_summary: dict | None = None,
     adv_eot_summary: dict | None = None,
 ) -> list[list[str]]:
+    metric_loss_label = get_metric_loss_label()
     clean_losses = {key: result["loss"] for key, result in clean_results.items()}
     adv_losses = {key: result["loss"] for key, result in adv_results.items()}
     worst_clean_key, worst_clean_loss, mean_clean_loss = summarize_loss_values(clean_losses)
@@ -1118,35 +1274,35 @@ def build_aggregate_summary_sections(
             [
                 [
                     (
-                        f"EoT worst-case clean target loss "
+                        f"EoT worst-case clean {metric_loss_label} "
                         f"({clean_eot_summary['num_samples']} samples): "
                         f"{clean_eot_summary['worst_loss']:.6f}"
                     ),
                     f"EoT worst-case clean model: {clean_eot_summary['worst_key']}",
                     (
-                        f"EoT worst-case adversarial target loss "
+                        f"EoT worst-case adversarial {metric_loss_label} "
                         f"({adv_eot_summary['num_samples']} samples): "
                         f"{adv_eot_summary['worst_loss']:.6f}"
                     ),
                     f"EoT worst-case adversarial model: {adv_eot_summary['worst_key']}",
                 ],
                 [
-                    f"EoT mean clean target loss: {clean_eot_summary['mean_loss']:.6f}",
-                    f"EoT mean adversarial target loss: {adv_eot_summary['mean_loss']:.6f}",
+                    f"EoT mean clean {metric_loss_label}: {clean_eot_summary['mean_loss']:.6f}",
+                    f"EoT mean adversarial {metric_loss_label}: {adv_eot_summary['mean_loss']:.6f}",
                 ],
             ]
         )
     sections.extend(
         [
             [
-                f"Worst-case clean target loss: {worst_clean_loss:.6f}",
+                f"Worst-case clean {metric_loss_label}: {worst_clean_loss:.6f}",
                 f"Worst-case clean model: {worst_clean_key}",
-                f"Worst-case adversarial target loss: {worst_adv_loss:.6f}",
+                f"Worst-case adversarial {metric_loss_label}: {worst_adv_loss:.6f}",
                 f"Worst-case adversarial model: {worst_adv_key}",
             ],
             [
-                f"Mean clean target loss: {mean_clean_loss:.6f}",
-                f"Mean adversarial target loss: {mean_adv_loss:.6f}",
+                f"Mean clean {metric_loss_label}: {mean_clean_loss:.6f}",
+                f"Mean adversarial {metric_loss_label}: {mean_adv_loss:.6f}",
             ],
         ]
     )
@@ -1161,14 +1317,15 @@ def build_model_summary_lines(
     clean_eot_summary: dict | None = None,
     adv_eot_summary: dict | None = None,
 ) -> list[str]:
+    metric_loss_label = get_metric_loss_label()
     lines = [
-        f"{key} clean target loss: {clean_results[key]['loss']:.6f}",
-        f"{key} adversarial target loss: {adv_results[key]['loss']:.6f}",
+        f"{key} clean {metric_loss_label}: {clean_results[key]['loss']:.6f}",
+        f"{key} adversarial {metric_loss_label}: {adv_results[key]['loss']:.6f}",
     ]
     return lines + (
         [
-            f"{key} EoT mean clean target loss: {clean_eot_summary['per_model_mean_losses'][key]:.6f}",
-            f"{key} EoT mean adversarial target loss: {adv_eot_summary['per_model_mean_losses'][key]:.6f}",
+            f"{key} EoT mean clean {metric_loss_label}: {clean_eot_summary['per_model_mean_losses'][key]:.6f}",
+            f"{key} EoT mean adversarial {metric_loss_label}: {adv_eot_summary['per_model_mean_losses'][key]:.6f}",
         ]
         if USE_EOT and clean_eot_summary is not None and adv_eot_summary is not None
         else []
@@ -1249,6 +1406,11 @@ def main() -> None:
 
         print("[Info] Evaluating clean image...")
         clean_results = evaluate_workers(workers, x_clean)
+        if ATTACK_MODE == "untargeted":
+            print("[Info] Initializing untargeted references from clean generations...")
+            set_workers_untargeted_references(workers, clean_results)
+            print("[Info] Re-evaluating clean image with untargeted reference loss...")
+            clean_results = evaluate_workers(workers, x_clean)
         clean_eot_summary = None
         if USE_EOT:
             print("[Info] Evaluating clean image under EoT...")
