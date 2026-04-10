@@ -1,11 +1,12 @@
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+from attacks.common import find_repo_root, load_image_tensor, project_delta, save_image_tensor
+from attacks.prompting import build_chat_prompt_inputs, build_teacher_forced_batch, generate_greedy_text
+from attacks.vision import build_qwen_vision_inputs
 
 MODEL_NAME = "prithivMLmods/Imgscope-OCR-2B-0527"
 SOURCE_IMAGE_PATH = Path("data/images/worksheet_000000.png")
@@ -18,222 +19,22 @@ RANDOM_START = False
 RESULT_PREFIX = "imgscope_ocr_pgd"
 
 MODEL_INPUT_SIZE = 448
-TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
 
-def find_repo_root(start: Path | None = None) -> Path:
-    current = (start or Path(__file__).resolve()).resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / "src").exists() and (candidate / "data").exists():
-            return candidate
-    raise RuntimeError(
-        "Could not locate the repo root from the current working directory. "
-        "Launch the script from this repository or one of its subdirectories."
-    )
-
-REPO_ROOT = find_repo_root()
+REPO_ROOT = find_repo_root(Path(__file__).resolve())
 RESULTS_DIR = REPO_ROOT / "results"
 SOURCE_IMAGE_PATH = REPO_ROOT / SOURCE_IMAGE_PATH
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
 OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_report.txt"
 
-def load_image_tensor(image_path: Path, device: torch.device) -> torch.Tensor:
-    image = Image.open(image_path).convert("RGB")
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
-    return tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
-
-def save_image_tensor(image_tensor: torch.Tensor, output_path: Path) -> None:
-    image = image_tensor.squeeze(0).detach().cpu().clamp(0.0, 1.0)
-    array = (
-        image.permute(1, 2, 0)
-        .mul(255.0)
-        .round()
-        .to(torch.uint8)
-        .numpy()
-    )
-    Image.fromarray(array).save(output_path)
-
-def pack_for_qwen(
-    image_tensor: torch.Tensor,
-    *,
-    model_input_size: int,
-    mean: torch.Tensor,
-    std: torch.Tensor,
-    patch_size: int,
-    temporal_patch_size: int,
-    merge_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    height, width = image_tensor.shape[-2:]
-    scale = min(model_input_size / height, model_input_size / width)
-    resized_h = max(1, int(round(height * scale)))
-    resized_w = max(1, int(round(width * scale)))
-
-    x = F.interpolate(
-        image_tensor.unsqueeze(0),
-        size=(resized_h, resized_w),
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0)
-
-    pad_h = model_input_size - resized_h
-    pad_w = model_input_size - resized_w
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
-    x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=1.0)
-    x = (x - mean) / std
-
-    frames = x.unsqueeze(0)
-    if frames.shape[0] % temporal_patch_size != 0:
-        repeats = temporal_patch_size - (frames.shape[0] % temporal_patch_size)
-        frames = torch.cat([frames, frames[-1:].repeat(repeats, 1, 1, 1)], dim=0)
-
-    channels = frames.shape[1]
-    grid_t = frames.shape[0] // temporal_patch_size
-    grid_h = frames.shape[2] // patch_size
-    grid_w = frames.shape[3] // patch_size
-
-    patches = frames.reshape(
-        grid_t,
-        temporal_patch_size,
-        channels,
-        grid_h // merge_size,
-        merge_size,
-        patch_size,
-        grid_w // merge_size,
-        merge_size,
-        patch_size,
-    )
-    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
-
-    pixel_values = patches.reshape(
-        grid_t * grid_h * grid_w,
-        channels * temporal_patch_size * patch_size * patch_size,
-    ).to(dtype=dtype)
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device=device, dtype=torch.long)
-    return pixel_values, image_grid_thw
-
-def build_text_model_inputs(
-    prompt_inputs: dict[str, torch.Tensor],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    model_inputs = {
-        "input_ids": prompt_inputs["input_ids"].to(device),
-        "attention_mask": prompt_inputs["attention_mask"].to(device),
-    }
-    for token_type_key in TOKEN_TYPE_INPUT_KEYS:
-        token_type_ids = prompt_inputs.get(token_type_key)
-        if token_type_ids is not None:
-            model_inputs[token_type_key] = token_type_ids.to(device)
-    return model_inputs
-
-def build_prompt_inputs(
-    processor,
-    device: torch.device,
-    prompt: str,
-) -> tuple[str, dict[str, torch.Tensor]]:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-    rendered_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    dummy_image = Image.new("RGB", (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE), color="white")
-    prompt_inputs = processor(
-        text=[rendered_prompt],
-        images=[dummy_image],
-        return_tensors="pt",
-    )
-    return rendered_prompt, build_text_model_inputs(prompt_inputs, device)
-
-def build_teacher_forced_inputs(
-    tokenizer,
-    prompt_model_inputs: dict[str, torch.Tensor],
-    clean_text: str,
-    device: torch.device,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    target_ids = tokenizer(clean_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is not None and (target_ids.shape[1] == 0 or target_ids[0, -1].item() != eos_token_id):
-        eos_tensor = torch.tensor([[eos_token_id]], device=device, dtype=target_ids.dtype)
-        target_ids = torch.cat([target_ids, eos_tensor], dim=1)
-
-    full_model_inputs = {
-        "input_ids": torch.cat([prompt_model_inputs["input_ids"], target_ids], dim=1),
-        "attention_mask": torch.cat(
-            [prompt_model_inputs["attention_mask"], torch.ones_like(target_ids)],
-            dim=1,
-        ),
-    }
-    for token_type_key in TOKEN_TYPE_INPUT_KEYS:
-        token_type_ids = prompt_model_inputs.get(token_type_key)
-        if token_type_ids is not None:
-            full_model_inputs[token_type_key] = torch.cat(
-                [
-                    token_type_ids,
-                    torch.zeros(target_ids.shape, device=device, dtype=token_type_ids.dtype),
-                ],
-                dim=1,
-            )
-
-    labels = full_model_inputs["input_ids"].clone()
-    labels[:, : prompt_model_inputs["input_ids"].shape[1]] = -100
-    return full_model_inputs, labels
-
-def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
-    pixel_values, image_grid_thw = pack_for_qwen(
-        image_tensor,
-        model_input_size=MODEL_INPUT_SIZE,
-        mean=state["mean"].view(3, 1, 1),
-        std=state["std"].view(3, 1, 1),
-        patch_size=state["patch_size"],
-        temporal_patch_size=state["temporal_patch_size"],
-        merge_size=state["merge_size"],
-        device=state["device"],
-        dtype=state["dtype"],
-    )
-    return {
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-    }
-
-def generate_transcript(
-    model,
-    processor,
-    prompt_model_inputs: dict[str, torch.Tensor],
-    prompt_token_count: int,
-    vision_inputs: dict[str, torch.Tensor],
-) -> str:
-    generated = model.generate(
-        **prompt_model_inputs,
-        **vision_inputs,
-        max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=False,
-    )
-    new_tokens = generated[:, prompt_token_count:]
-    return processor.batch_decode(
-        new_tokens,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0].strip()
-
 def transcription_loss(
     model,
-    teacher_forced_inputs: dict[str, torch.Tensor],
-    labels: torch.Tensor,
+    teacher_forced_batch: dict[str, torch.Tensor],
     vision_inputs: dict[str, torch.Tensor],
 ) -> torch.Tensor:
     outputs = model(
-        **teacher_forced_inputs,
+        **teacher_forced_batch["model_inputs"],
         **vision_inputs,
-        labels=labels,
+        labels=teacher_forced_batch["labels"],
         use_cache=False,
         return_dict=True,
     )
@@ -241,16 +42,14 @@ def transcription_loss(
 
 def run_pgd(
     model,
-    teacher_forced_inputs: dict[str, torch.Tensor],
-    labels: torch.Tensor,
+    teacher_forced_batch: dict[str, torch.Tensor],
     state: dict,
     x_clean: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
     delta = torch.zeros_like(x_clean, dtype=torch.float32)
     if RANDOM_START:
         delta.uniform_(-EPSILON, EPSILON)
-        delta.clamp_(-EPSILON, EPSILON)
-        delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
+        project_delta(delta, x_clean, EPSILON)
     delta.requires_grad_(True)
 
     saw_nonzero_grad = False
@@ -262,8 +61,8 @@ def run_pgd(
             delta.grad.zero_()
 
         x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
-        vision_inputs = build_vision_inputs(state, x_adv.squeeze(0))
-        loss = transcription_loss(model, teacher_forced_inputs, labels, vision_inputs)
+        vision_inputs = build_qwen_vision_inputs(state, x_adv.squeeze(0))
+        loss = transcription_loss(model, teacher_forced_batch, vision_inputs)
         loss.backward()
 
         if delta.grad is None:
@@ -275,8 +74,7 @@ def run_pgd(
 
         with torch.no_grad():
             delta.add_(ALPHA * grad.sign())
-            delta.clamp_(-EPSILON, EPSILON)
-            delta.copy_(torch.clamp(x_clean + delta, 0.0, 1.0) - x_clean)
+            project_delta(delta, x_clean, EPSILON)
 
         last_loss = float(loss.item())
         last_grad_inf = grad_inf
@@ -375,6 +173,7 @@ def main() -> None:
     state = {
         "device": device,
         "dtype": model_dtype,
+        "model_input_size": MODEL_INPUT_SIZE,
         "patch_size": vision_config.patch_size,
         "temporal_patch_size": vision_config.temporal_patch_size,
         "merge_size": vision_config.spatial_merge_size,
@@ -382,23 +181,29 @@ def main() -> None:
         "std": torch.tensor(processor.image_processor.image_std, device=device, dtype=torch.float32),
     }
 
-    _, prompt_model_inputs = build_prompt_inputs(processor, device, OCR_PROMPT)
+    _, prompt_model_inputs = build_chat_prompt_inputs(
+        processor,
+        device,
+        OCR_PROMPT,
+        (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
+    )
     prompt_token_count = prompt_model_inputs["input_ids"].shape[1]
 
     x_clean = load_image_tensor(SOURCE_IMAGE_PATH, device)
-    clean_vision_inputs = build_vision_inputs(state, x_clean.squeeze(0))
+    clean_vision_inputs = build_qwen_vision_inputs(state, x_clean.squeeze(0))
     with torch.no_grad():
-        clean_text = generate_transcript(
+        clean_text = generate_greedy_text(
             model,
             processor,
             prompt_model_inputs,
             prompt_token_count,
             clean_vision_inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
         )
     if not clean_text:
         raise RuntimeError("Clean OCR transcript was empty.")
 
-    teacher_forced_inputs, labels = build_teacher_forced_inputs(
+    teacher_forced_batch = build_teacher_forced_batch(
         processor.tokenizer,
         prompt_model_inputs,
         clean_text,
@@ -408,20 +213,20 @@ def main() -> None:
     print("Running PGD...")
     x_adv, delta, final_loss, final_grad_inf = run_pgd(
         model,
-        teacher_forced_inputs,
-        labels,
+        teacher_forced_batch,
         state,
         x_clean,
     )
 
-    adv_vision_inputs = build_vision_inputs(state, x_adv.squeeze(0))
+    adv_vision_inputs = build_qwen_vision_inputs(state, x_adv.squeeze(0))
     with torch.no_grad():
-        adv_text = generate_transcript(
+        adv_text = generate_greedy_text(
             model,
             processor,
             prompt_model_inputs,
             prompt_token_count,
             adv_vision_inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
         )
 
     linf_delta = float(delta.abs().max().item())
