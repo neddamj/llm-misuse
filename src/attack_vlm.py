@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import traceback
 
@@ -28,20 +29,20 @@ RESULTS_DIR = REPO_ROOT / "results"
 
 MODEL_SPECS = [
     {
-        "key": "qwen3_vl",
-        "model_name": "Qwen/Qwen3-VL-4B-Instruct",
+        "key": "granite_vision_3_2",
+        "model_name": "ibm-granite/granite-vision-3.2-2b",
         "model_family": "auto",
         "device": "cuda:0",
     },
     {
-        "key": "llava",
-        "model_name": "llava-hf/llava-1.5-7b-hf",
+        "key": "gemma3_4b_it",
+        "model_name": "google/gemma-3-4b-it",
         "model_family": "auto",
         "device": "cuda:1",
     },
     {
-        "key": "gemma3_4b_it",
-        "model_name": "google/gemma-3-4b-it",
+        "key": "smolvlm_2b_instruct",
+        "model_name": "HuggingFaceTB/SmolVLM-Instruct",
         "model_family": "auto",
         "device": "cuda:2",
     },
@@ -66,7 +67,7 @@ ATTACK_IMAGE_SIZE = (400, 400)
 MODEL_INPUT_SIZE = 448
 MAX_NEW_TOKENS = 128
 CROSS_MODEL_SOFTMINIMAX_TEMPERATURE = 1.0
-USE_EOT = True
+USE_EOT = False
 EOT_TRAIN_SAMPLES = 4
 EOT_EVAL_SAMPLES = 1
 EOT_ROTATION_DEGREES = 0 #5
@@ -78,7 +79,7 @@ EOT_COLOR_JITTER_CONTRAST = 0.1
 EOT_COLOR_JITTER_SATURATION = 0.1
 EOT_GAUSSIAN_NOISE_STD = 0.02
 
-RESULT_PREFIX = "qwen3vl_llava_gemma3_textgen_multi_gpu"
+RESULT_PREFIX = "granite_gemma3_smolvlm_textgen_multi_gpu"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
 OUTPUT_NOISE_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_noise.png"
 OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_generations.txt"
@@ -88,10 +89,13 @@ CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 SUPPORTED_MODEL_TYPES = {
     "gemma3": "gemma",
+    "idefics3": "smolvlm",
     "qwen2_vl": "qwen",
     "qwen2_5_vl": "qwen",
     "qwen3_vl": "qwen",
     "llava": "llava",
+    "llava_next": "llava_next",
+    "smolvlm": "smolvlm",
 }
 
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
@@ -172,8 +176,11 @@ def sample_camera_transform(image_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def resolve_model_family(requested_model_family: str, model_type: str) -> str:
-    if requested_model_family not in {"auto", "gemma", "qwen", "llava"}:
-        raise ValueError("MODEL_FAMILY must be one of: 'auto', 'gemma', 'qwen', 'llava'.")
+    if requested_model_family not in {"auto", "gemma", "qwen", "llava", "llava_next", "smolvlm"}:
+        raise ValueError(
+            "MODEL_FAMILY must be one of: "
+            "'auto', 'gemma', 'qwen', 'llava', 'llava_next', 'smolvlm'."
+        )
 
     detected_model_family = SUPPORTED_MODEL_TYPES.get(model_type)
     if detected_model_family is None:
@@ -283,6 +290,175 @@ def pack_for_llava(
     left = max(0, (resized_w - crop_w) // 2)
     x = x[:, :, top : top + crop_h, left : left + crop_w]
     return (x - mean) / std
+
+
+def resize_bilinear(
+    image_tensor: torch.Tensor,
+    size: tuple[int, int],
+) -> torch.Tensor:
+    needs_batch_dim = image_tensor.ndim == 3
+    x = image_tensor.unsqueeze(0) if needs_batch_dim else image_tensor
+    x = F.interpolate(
+        x,
+        size=size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    if needs_batch_dim:
+        return x.squeeze(0)
+    return x
+
+
+def center_crop_or_pad(
+    image_tensor: torch.Tensor,
+    crop_size: tuple[int, int],
+) -> torch.Tensor:
+    needs_batch_dim = image_tensor.ndim == 3
+    x = image_tensor.unsqueeze(0) if needs_batch_dim else image_tensor
+
+    crop_h, crop_w = crop_size
+    height, width = x.shape[-2:]
+
+    if height < crop_h or width < crop_w:
+        pad_h = max(0, crop_h - height)
+        pad_w = max(0, crop_w - width)
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+        height, width = x.shape[-2:]
+
+    top = max(0, (height - crop_h) // 2)
+    left = max(0, (width - crop_w) // 2)
+    x = x[:, :, top : top + crop_h, left : left + crop_w]
+
+    if needs_batch_dim:
+        return x.squeeze(0)
+    return x
+
+
+def maybe_rescale(image_tensor: torch.Tensor, rescale_factor: float) -> torch.Tensor:
+    if torch.max(image_tensor) > 1.0:
+        return image_tensor * rescale_factor
+    return image_tensor
+
+
+def resize_longest_edge(
+    image_tensor: torch.Tensor,
+    longest_edge: int,
+) -> torch.Tensor:
+    height, width = image_tensor.shape[-2:]
+    aspect_ratio = width / height
+
+    if width >= height:
+        resized_width = longest_edge
+        resized_height = int(resized_width / aspect_ratio)
+        if resized_height % 2 != 0:
+            resized_height += 1
+    else:
+        resized_height = longest_edge
+        resized_width = int(resized_height * aspect_ratio)
+        if resized_width % 2 != 0:
+            resized_width += 1
+
+    resized_height = max(resized_height, 1)
+    resized_width = max(resized_width, 1)
+    return resize_bilinear(image_tensor, (resized_height, resized_width))
+
+
+def pack_for_llava_next(
+    image_tensor: torch.Tensor,
+    *,
+    resize_size: tuple[int, int],
+    crop_size: tuple[int, int],
+    image_grid_pinpoints: list[tuple[int, int]],
+    rescale_factor: float,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_height, original_width = image_tensor.shape[-2:]
+    best_height, best_width = max(
+        image_grid_pinpoints,
+        key=lambda resolution: (
+            min(
+                int(original_width * min(resolution[1] / original_width, resolution[0] / original_height))
+                * int(original_height * min(resolution[1] / original_width, resolution[0] / original_height)),
+                original_width * original_height,
+            ),
+            -(
+                resolution[0] * resolution[1]
+                - min(
+                    int(original_width * min(resolution[1] / original_width, resolution[0] / original_height))
+                    * int(original_height * min(resolution[1] / original_width, resolution[0] / original_height)),
+                    original_width * original_height,
+                )
+            ),
+        ),
+    )
+
+    scale_w = best_width / original_width
+    scale_h = best_height / original_height
+    if scale_w < scale_h:
+        resized_width = best_width
+        resized_height = min(math.ceil(original_height * scale_w), best_height)
+    else:
+        resized_height = best_height
+        resized_width = min(math.ceil(original_width * scale_h), best_width)
+
+    padded_image = resize_bilinear(image_tensor, (resized_height, resized_width))
+    pad_h = best_height - resized_height
+    pad_w = best_width - resized_width
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    padded_image = F.pad(padded_image, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+
+    patch_size = crop_size[0]
+    patches = padded_image.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)
+    patches = patches.permute(1, 2, 0, 3, 4).contiguous().view(-1, image_tensor.shape[0], patch_size, patch_size)
+
+    global_image = resize_bilinear(image_tensor, resize_size)
+    global_image = center_crop_or_pad(global_image, crop_size).unsqueeze(0)
+
+    local_images = resize_bilinear(patches, resize_size)
+    local_images = center_crop_or_pad(local_images, crop_size)
+
+    pixel_values = torch.cat([global_image, local_images], dim=0)
+    pixel_values = maybe_rescale(pixel_values, rescale_factor)
+    pixel_values = (pixel_values - mean) / std
+
+    image_sizes = torch.tensor(
+        [[original_height, original_width]],
+        device=device,
+        dtype=torch.long,
+    )
+    return pixel_values.unsqueeze(0), image_sizes
+
+
+def pack_for_smolvlm(
+    image_tensor: torch.Tensor,
+    *,
+    resize_longest_edge_value: int,
+    max_image_size: int,
+    rescale_factor: float,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = resize_longest_edge(image_tensor, resize_longest_edge_value)
+    x = resize_bilinear(x, (max_image_size, max_image_size))
+    x = maybe_rescale(x, rescale_factor)
+    x = (x - mean) / std
+
+    pixel_values = x.unsqueeze(0).unsqueeze(0)
+    pixel_attention_mask = torch.ones(
+        (1, 1, max_image_size, max_image_size),
+        device=image_tensor.device,
+        dtype=torch.bool,
+    )
+    return pixel_values, pixel_attention_mask
 
 
 def pack_for_gemma(
@@ -525,7 +701,7 @@ def load_worker_state(model_spec: dict) -> dict:
     processor = AutoProcessor.from_pretrained(model_spec["model_name"], use_fast=False)
     model = AutoModelForImageTextToText.from_pretrained(
         model_spec["model_name"],
-        torch_dtype=dtype,
+        dtype=dtype,
     ).to(device)
     model.config.use_cache = False
     model.eval()
@@ -557,6 +733,44 @@ def load_worker_state(model_spec: dict) -> dict:
             "dummy_image_size": (size[1], size[0]),
         }
         prompt_processor_kwargs["do_pan_and_scan"] = False
+    elif model_family == "llava_next":
+        image_processor = processor.image_processor
+        size = image_processor.size
+        shortest_edge = size.get("shortest_edge")
+        if shortest_edge is not None:
+            resize_size = (int(shortest_edge), int(shortest_edge))
+        else:
+            resize_size = (
+                int(size["height"]),
+                int(size["width"]),
+            )
+        crop_size = (
+            int(image_processor.crop_size["height"]),
+            int(image_processor.crop_size["width"]),
+        )
+        vision_state = {
+            "resize_size": resize_size,
+            "crop_size": crop_size,
+            "image_grid_pinpoints": [
+                (int(height), int(width))
+                for height, width in image_processor.image_grid_pinpoints
+            ],
+            "rescale_factor": float(image_processor.rescale_factor),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "dummy_image_size": (ATTACK_IMAGE_SIZE[1], ATTACK_IMAGE_SIZE[0]),
+        }
+    elif model_family == "smolvlm":
+        image_processor = processor.image_processor
+        vision_state = {
+            "resize_longest_edge": int(image_processor.size["longest_edge"]),
+            "max_image_size": int(image_processor.max_image_size["longest_edge"]),
+            "rescale_factor": float(image_processor.rescale_factor),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "dummy_image_size": (ATTACK_IMAGE_SIZE[1], ATTACK_IMAGE_SIZE[0]),
+        }
+        prompt_processor_kwargs["do_image_splitting"] = False
     else:
         image_processor = processor.image_processor
         shortest_edge = image_processor.size.get("shortest_edge")
@@ -643,6 +857,36 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
             std=vision_state["std"].view(1, 3, 1, 1),
         )
         return {"pixel_values": pixel_values}
+
+    if state["model_family"] == "llava_next":
+        pixel_values, image_sizes = pack_for_llava_next(
+            image_tensor,
+            resize_size=vision_state["resize_size"],
+            crop_size=vision_state["crop_size"],
+            image_grid_pinpoints=vision_state["image_grid_pinpoints"],
+            rescale_factor=vision_state["rescale_factor"],
+            mean=vision_state["mean"].view(1, 3, 1, 1),
+            std=vision_state["std"].view(1, 3, 1, 1),
+            device=state["device"],
+        )
+        return {
+            "pixel_values": pixel_values,
+            "image_sizes": image_sizes,
+        }
+
+    if state["model_family"] == "smolvlm":
+        pixel_values, pixel_attention_mask = pack_for_smolvlm(
+            image_tensor,
+            resize_longest_edge_value=vision_state["resize_longest_edge"],
+            max_image_size=vision_state["max_image_size"],
+            rescale_factor=vision_state["rescale_factor"],
+            mean=vision_state["mean"].view(3, 1, 1),
+            std=vision_state["std"].view(3, 1, 1),
+        )
+        return {
+            "pixel_values": pixel_values,
+            "pixel_attention_mask": pixel_attention_mask,
+        }
 
     pixel_values = pack_for_llava(
         image_tensor,
