@@ -15,6 +15,7 @@ from attacks.vision import sample_camera_transform
 from attacks.workers import (
     attack_workers,
     evaluate_workers,
+    evaluate_workers_loss_only,
     set_workers_untargeted_references,
     shutdown_workers,
     start_workers,
@@ -24,7 +25,30 @@ from attacks.workers import (
 REPO_ROOT = find_repo_root()
 RESULTS_DIR = REPO_ROOT / "results"
 
-MODEL_SPECS = [
+SIGLIP2_MODEL_SPECS = [
+    {
+        "key": "aya_vision_8b",
+        "model_name": "CohereLabs/aya-vision-8b",
+        "model_family": "aya_vision",
+        "device": "cuda:0",
+    },
+    {
+        "key": "jina_vlm",
+        "model_name": "jinaai/jina-vlm",
+        "model_family": "jina_vlm",
+        "device": "cuda:1",
+        "auto_model_class": "causal_lm",
+        "trust_remote_code": True,
+    },
+    {
+        "key": "lfm2_5_vl_1_6b",
+        "model_name": "LiquidAI/LFM2.5-VL-1.6B",
+        "model_family": "lfm2_vl",
+        "device": "cuda:2",
+    },
+]
+
+SIGLIP_MODEL_SPECS = [
     {
         "key": "granite_vision_3_2",
         "model_name": "ibm-granite/granite-vision-3.2-2b",
@@ -45,24 +69,28 @@ MODEL_SPECS = [
     },
 ]
 
-
-SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / "worksheet_000002.png"
-USER_PROMPT = "Solve the math problems shown in the image. Show steps and give the final answers."
+img_idx = 15
+SPEC = "siglip" # Options: "siglip2", "siglip"
+SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / f"{img_idx}.png"
+USER_PROMPT = "Solve the problems shown in the image. Show steps and give the final answers."
 ATTACK_MODE = "untargeted" # Options: "targeted", "untargeted"
 TARGET_TEXTS: list[str] = [
     "I cannot help with that",
     "No",
     "I'm sorry, I cant answer that.",
 ]
+
 TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 CROSS_MODEL_OPTIMIZATION_MODE = "mean_ce" # Options: "mean_ce", "softminimax"
 
-EPSILON = 64 / 255
+NUM, DEN = 32, 255
+EPSILON = NUM / DEN
 ALPHA = 4 / 1000
 STEPS = 1500
-ATTACK_IMAGE_SIZE = (400, 400)
+ATTACK_IMAGE_SIZE = (448, 448)
 MODEL_INPUT_SIZE = 448
 MAX_NEW_TOKENS = 128
+PROGRESS_POSTFIX_EVERY = 10
 CROSS_MODEL_SOFTMINIMAX_TEMPERATURE = 1.0
 USE_EOT = False
 EOT_TRAIN_SAMPLES = 4
@@ -76,10 +104,10 @@ EOT_COLOR_JITTER_CONTRAST = 0.1
 EOT_COLOR_JITTER_SATURATION = 0.1
 EOT_GAUSSIAN_NOISE_STD = 0.02
 
-RESULT_PREFIX = "granite_gemma3_smolvlm_textgen_multi_gpu"
-OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv.png"
-OUTPUT_NOISE_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_noise.png"
-OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_generations.txt"
+RESULT_PREFIX = "vlm_textgen_multi_gpu"
+OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv_{img_idx}_{SPEC}_{NUM}.png"
+OUTPUT_NOISE_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_noise_{img_idx}_{SPEC}_{NUM}.png"
+OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_generations_{img_idx}_{SPEC}_{NUM}.txt"
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -87,6 +115,14 @@ SUPPORTED_ATTACK_MODES = {"targeted", "untargeted"}
 SUPPORTED_TARGET_LOSS_MODES = {"multi_reference", "standard_ce"}
 SUPPORTED_CROSS_MODEL_OPTIMIZATION_MODES = {"mean_ce", "softminimax"}
 
+if SPEC == "siglip2":
+    MODEL_SPECS = SIGLIP2_MODEL_SPECS
+elif SPEC == "siglip":
+    MODEL_SPECS = SIGLIP_MODEL_SPECS
+else:
+    raise ValueError(
+        f"SPEC must be one of: 'siglip2', 'siglip'. Got {SPEC!r}."
+    )
 
 def save_noise_visualization(delta: torch.Tensor, output_path: Path) -> None:
     noise = torch.clamp(delta.squeeze(0).cpu() * 10 + 0.5, 0.0, 1.0)
@@ -178,6 +214,34 @@ def compute_cross_model_aggregation(
     if not ordered_keys or not gradients:
         raise RuntimeError("Expected at least one worker result for cross-model aggregation.")
 
+    if CROSS_MODEL_OPTIMIZATION_MODE == "mean_ce":
+        aggregated_grad = None
+        optimization_loss_sum = 0.0
+        worst_key = ordered_keys[0]
+        worst_metric_loss = metric_losses_by_key[worst_key]
+        worst_optimization_loss = optimization_losses_by_key[worst_key]
+
+        for key, grad in zip(ordered_keys, gradients):
+            optimization_loss = optimization_losses_by_key[key]
+            optimization_loss_sum += optimization_loss
+            if optimization_loss > worst_optimization_loss:
+                worst_key = key
+                worst_metric_loss = metric_losses_by_key[key]
+                worst_optimization_loss = optimization_loss
+
+            grad_on_device = grad.to(device=device, dtype=dtype)
+            if aggregated_grad is None:
+                aggregated_grad = grad_on_device.clone()
+            else:
+                aggregated_grad.add_(grad_on_device)
+
+        if aggregated_grad is None:
+            raise RuntimeError("Expected at least one gradient for mean cross-model aggregation.")
+
+        aggregated_grad.div_(len(ordered_keys))
+        aggregate_loss = optimization_loss_sum / len(ordered_keys)
+        return aggregated_grad, worst_key, float(worst_metric_loss), aggregate_loss
+
     metric_losses = torch.tensor(
         [metric_losses_by_key[key] for key in ordered_keys],
         device=device,
@@ -216,16 +280,6 @@ def compute_cross_model_aggregation(
             aggregate_loss,
         )
 
-    if CROSS_MODEL_OPTIMIZATION_MODE == "mean_ce":
-        aggregated_grad = stacked_grads.mean(dim=0)
-        aggregate_loss = float(optimization_losses.mean().item())
-        return (
-            aggregated_grad,
-            ordered_keys[worst_index],
-            float(metric_losses[worst_index].item()),
-            aggregate_loss,
-        )
-
     raise ValueError(
         f"Unsupported CROSS_MODEL_OPTIMIZATION_MODE: {CROSS_MODEL_OPTIMIZATION_MODE!r}"
     )
@@ -251,9 +305,9 @@ def evaluate_workers_eot(
                 color_jitter_saturation=EOT_COLOR_JITTER_SATURATION,
                 gaussian_noise_std=EOT_GAUSSIAN_NOISE_STD,
             ).unsqueeze(0)
-        sample_results = evaluate_workers(workers, transformed_image)
-        for key, result in sample_results.items():
-            loss_sums[key] += result["loss"]
+        sample_losses = evaluate_workers_loss_only(workers, transformed_image)
+        for key, loss in sample_losses.items():
+            loss_sums[key] += loss
 
     per_model_mean_losses = {key: loss_sums[key] / num_samples for key in loss_sums}
     worst_key, worst_loss, mean_loss = summarize_loss_values(
@@ -267,6 +321,8 @@ def evaluate_workers_eot(
         "worst_loss": worst_loss,
         "mean_loss": mean_loss,
     }
+
+
 def build_progress_postfix(
     losses_by_key: dict[str, float],
     worst_key: str,
@@ -295,12 +351,67 @@ def get_metric_loss_label() -> str:
     return "target loss"
 
 
+def should_update_progress(step_index: int) -> bool:
+    return (
+        step_index == 0
+        or step_index == STEPS - 1
+        or (step_index + 1) % PROGRESS_POSTFIX_EVERY == 0
+    )
+
+
+def run_eot_attack_step(
+    workers: list[dict],
+    x_clean: torch.Tensor,
+    delta: torch.Tensor,
+) -> tuple[dict[str, float], float]:
+    x_adv_leaf = torch.clamp(x_clean + delta, 0.0, 1.0).detach().requires_grad_(True)
+    eot_loss_sums = {model_spec["key"]: 0.0 for model_spec in MODEL_SPECS}
+    eot_aggregate_loss = 0.0
+
+    for _ in range(EOT_TRAIN_SAMPLES):
+        transformed_image = sample_camera_transform(
+            x_adv_leaf.squeeze(0),
+            rotation_degrees=EOT_ROTATION_DEGREES,
+            perspective_distortion=EOT_PERSPECTIVE_DISTORTION,
+            crop_scale=EOT_CROP_SCALE,
+            crop_ratio=EOT_CROP_RATIO,
+            color_jitter_brightness=EOT_COLOR_JITTER_BRIGHTNESS,
+            color_jitter_contrast=EOT_COLOR_JITTER_CONTRAST,
+            color_jitter_saturation=EOT_COLOR_JITTER_SATURATION,
+            gaussian_noise_std=EOT_GAUSSIAN_NOISE_STD,
+        ).unsqueeze(0)
+        ordered_keys, step_results, optimization_losses, gradients = attack_workers(workers, transformed_image)
+        aggregated_grad, _, _, sample_aggregate_loss = compute_cross_model_aggregation(
+            ordered_keys,
+            step_results,
+            optimization_losses,
+            gradients,
+            device=delta.device,
+            dtype=delta.dtype,
+        )
+        transformed_image.backward(aggregated_grad)
+        eot_aggregate_loss += sample_aggregate_loss
+        for key, loss in step_results.items():
+            eot_loss_sums[key] += loss
+
+    if x_adv_leaf.grad is None:
+        raise RuntimeError("Expected EoT gradients on the adversarial image leaf tensor.")
+
+    x_adv_leaf.grad.div_(EOT_TRAIN_SAMPLES)
+    x_adv_live = torch.clamp(x_clean + delta, 0.0, 1.0)
+    x_adv_live.backward(x_adv_leaf.grad)
+    return (
+        {key: eot_loss_sums[key] / EOT_TRAIN_SAMPLES for key in eot_loss_sums},
+        eot_aggregate_loss / EOT_TRAIN_SAMPLES,
+    )
+
+
 def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     delta = torch.zeros_like(x_clean, requires_grad=True)
     optimizer = torch.optim.AdamW([delta], lr=ALPHA, weight_decay=0.0)
     progress = tqdm(range(STEPS))
 
-    for _ in progress:
+    for step_index in progress:
         optimizer.zero_grad(set_to_none=True)
         if not USE_EOT:
             x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
@@ -321,69 +432,40 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
                 step_results,
                 higher_is_worse=ATTACK_MODE == "targeted",
             )
-            progress.set_postfix(
-                build_progress_postfix(
-                    step_results,
-                    worst_key,
-                    worst_loss,
-                    aggregate_loss,
-                    mean_loss,
+            if should_update_progress(step_index):
+                progress.set_postfix(
+                    build_progress_postfix(
+                        step_results,
+                        worst_key,
+                        worst_loss,
+                        aggregate_loss,
+                        mean_loss,
+                    )
                 )
-            )
             continue
 
-        eot_loss_sums = {model_spec["key"]: 0.0 for model_spec in MODEL_SPECS}
-        eot_aggregate_loss = 0.0
-        for _ in range(EOT_TRAIN_SAMPLES):
-            x_adv = torch.clamp(x_clean + delta, 0.0, 1.0)
-            transformed_image = sample_camera_transform(
-                x_adv.squeeze(0),
-                rotation_degrees=EOT_ROTATION_DEGREES,
-                perspective_distortion=EOT_PERSPECTIVE_DISTORTION,
-                crop_scale=EOT_CROP_SCALE,
-                crop_ratio=EOT_CROP_RATIO,
-                color_jitter_brightness=EOT_COLOR_JITTER_BRIGHTNESS,
-                color_jitter_contrast=EOT_COLOR_JITTER_CONTRAST,
-                color_jitter_saturation=EOT_COLOR_JITTER_SATURATION,
-                gaussian_noise_std=EOT_GAUSSIAN_NOISE_STD,
-            ).unsqueeze(0)
-            ordered_keys, step_results, optimization_losses, gradients = attack_workers(workers, transformed_image)
-            aggregated_grad, _, _, sample_aggregate_loss = compute_cross_model_aggregation(
-                ordered_keys,
-                step_results,
-                optimization_losses,
-                gradients,
-                device=delta.device,
-                dtype=delta.dtype,
-            )
-            transformed_image.backward(aggregated_grad)
-            eot_aggregate_loss += sample_aggregate_loss
-            for key, loss in step_results.items():
-                eot_loss_sums[key] += loss
-
+        eot_step_results, eot_aggregate_loss = run_eot_attack_step(workers, x_clean, delta)
         if delta.grad is None:
             raise RuntimeError("Expected EoT gradients on the perturbation tensor.")
 
-        delta.grad.div_(EOT_TRAIN_SAMPLES)
         optimizer.step()
         project_delta(delta, x_clean, EPSILON)
 
-        eot_step_results = {key: eot_loss_sums[key] / EOT_TRAIN_SAMPLES for key in eot_loss_sums}
         eot_worst_key, eot_worst_loss, eot_mean_loss = summarize_loss_values(
             eot_step_results,
             higher_is_worse=ATTACK_MODE == "targeted",
         )
-        eot_aggregate_loss /= EOT_TRAIN_SAMPLES
-        progress.set_postfix(
-            build_progress_postfix(
-                eot_step_results,
-                eot_worst_key,
-                eot_worst_loss,
-                eot_aggregate_loss,
-                eot_mean_loss,
-                prefix="eot_",
+        if should_update_progress(step_index):
+            progress.set_postfix(
+                build_progress_postfix(
+                    eot_step_results,
+                    eot_worst_key,
+                    eot_worst_loss,
+                    eot_aggregate_loss,
+                    eot_mean_loss,
+                    prefix="eot_",
+                )
             )
-        )
 
     return torch.clamp(x_clean + delta, 0.0, 1.0).detach(), delta.detach()
 
@@ -603,7 +685,9 @@ def main() -> None:
             print("[Info] Initializing untargeted references from clean generations...")
             set_workers_untargeted_references(workers, clean_results)
             print("[Info] Re-evaluating clean image with untargeted reference loss...")
-            clean_results = evaluate_workers(workers, x_clean)
+            clean_losses = evaluate_workers_loss_only(workers, x_clean)
+            for key, loss in clean_losses.items():
+                clean_results[key]["loss"] = loss
         clean_eot_summary = None
         if USE_EOT:
             print("[Info] Evaluating clean image under EoT...")

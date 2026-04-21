@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -8,8 +9,11 @@ from torchvision.transforms import functional as TF
 
 
 SUPPORTED_MODEL_TYPES = {
+    "aya_vision": "aya_vision",
     "gemma3": "gemma",
+    "jvlm": "jina_vlm",
     "idefics3": "smolvlm",
+    "lfm2_vl": "lfm2_vl",
     "qwen2_vl": "qwen",
     "qwen2_5_vl": "qwen",
     "qwen3_vl": "qwen",
@@ -20,10 +24,21 @@ SUPPORTED_MODEL_TYPES = {
 
 
 def resolve_model_family(requested_model_family: str, model_type: str) -> str:
-    if requested_model_family not in {"auto", "gemma", "qwen", "llava", "llava_next", "smolvlm"}:
+    if requested_model_family not in {
+        "auto",
+        "aya_vision",
+        "gemma",
+        "jina_vlm",
+        "lfm2_vl",
+        "qwen",
+        "llava",
+        "llava_next",
+        "smolvlm",
+    }:
         raise ValueError(
             "MODEL_FAMILY must be one of: "
-            "'auto', 'gemma', 'qwen', 'llava', 'llava_next', 'smolvlm'."
+            "'auto', 'aya_vision', 'gemma', 'jina_vlm', 'lfm2_vl', "
+            "'qwen', 'llava', 'llava_next', 'smolvlm'."
         )
 
     detected_model_family = SUPPORTED_MODEL_TYPES.get(model_type)
@@ -157,10 +172,97 @@ def pack_for_llava(
     return (x - mean) / std
 
 
+@lru_cache(maxsize=None)
+def get_all_supported_aspect_ratios(max_image_tiles: int) -> tuple[tuple[int, int], ...]:
+    aspect_ratios = []
+    for width in range(1, max_image_tiles + 1):
+        for height in range(1, max_image_tiles + 1):
+            if width * height <= max_image_tiles:
+                aspect_ratios.append((width, height))
+    return tuple(aspect_ratios)
+
+
+def get_optimal_tiled_canvas(
+    original_image_size: tuple[int, int],
+    target_tile_size: tuple[int, int],
+    min_image_tiles: int,
+    max_image_tiles: int,
+) -> tuple[int, int]:
+    possible_resolutions = get_all_supported_aspect_ratios(max_image_tiles)
+    possible_resolutions = sorted(possible_resolutions, key=lambda ratio: ratio[0] * ratio[1])
+    image_height, image_width = original_image_size
+    patch_size_height, _ = target_tile_size
+
+    best_grid = possible_resolutions[0]
+    best_scale = None
+    for grid_width, grid_height in possible_resolutions:
+        if grid_width * grid_height < min_image_tiles:
+            continue
+        target_width = grid_width * patch_size_height
+        target_height = grid_height * patch_size_height
+        scale = min(target_width / image_width, target_height / image_height)
+        if best_scale is None:
+            best_scale = scale
+            best_grid = (grid_width, grid_height)
+            continue
+        if best_scale < 1 and scale > best_scale:
+            best_scale = scale
+            best_grid = (grid_width, grid_height)
+            continue
+        if best_scale >= 1:
+            adjusted_scale = scale if scale >= 1 else float("inf")
+            adjusted_best_scale = best_scale if best_scale >= 1 else float("inf")
+            if adjusted_scale < adjusted_best_scale:
+                best_scale = scale
+                best_grid = (grid_width, grid_height)
+    return best_grid
+
+
+def pack_for_aya_vision(
+    image_tensor: torch.Tensor,
+    *,
+    tile_size: tuple[int, int],
+    min_patches: int,
+    max_patches: int,
+    rescale_factor: float,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    use_thumbnail: bool = True,
+) -> torch.Tensor:
+    patch_height, patch_width = tile_size
+    original_height, original_width = image_tensor.shape[-2:]
+    num_columns, num_rows = get_optimal_tiled_canvas(
+        (original_height, original_width),
+        tile_size,
+        min_patches,
+        max_patches,
+    )
+    target_width = patch_width * num_columns
+    target_height = patch_height * num_rows
+    resized_image = resize_bilinear(image_tensor, (target_height, target_width))
+
+    processed_images = []
+    for row in range(num_rows):
+        for column in range(num_columns):
+            top = row * patch_height
+            left = column * patch_width
+            processed_images.append(resized_image[:, top : top + patch_height, left : left + patch_width])
+
+    if use_thumbnail and len(processed_images) != 1:
+        processed_images.append(resize_bilinear(image_tensor, tile_size))
+
+    pixel_values = torch.stack(processed_images, dim=0)
+    pixel_values = maybe_rescale(pixel_values, rescale_factor)
+    return (pixel_values - mean) / std
+
+
 def resize_bilinear(
     image_tensor: torch.Tensor,
     size: tuple[int, int],
 ) -> torch.Tensor:
+    if image_tensor.shape[-2:] == size:
+        return image_tensor
+
     needs_batch_dim = image_tensor.ndim == 3
     x = image_tensor.unsqueeze(0) if needs_batch_dim else image_tensor
     x = F.interpolate(
@@ -178,6 +280,9 @@ def center_crop_or_pad(
     image_tensor: torch.Tensor,
     crop_size: tuple[int, int],
 ) -> torch.Tensor:
+    if image_tensor.shape[-2:] == crop_size:
+        return image_tensor
+
     needs_batch_dim = image_tensor.ndim == 3
     x = image_tensor.unsqueeze(0) if needs_batch_dim else image_tensor
 
@@ -209,6 +314,48 @@ def maybe_rescale(image_tensor: torch.Tensor, rescale_factor: float) -> torch.Te
     return image_tensor
 
 
+def round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def convert_image_to_patches_channel_first(images: torch.Tensor, patch_size: int) -> torch.Tensor:
+    if images.ndim != 4:
+        raise ValueError("Expected images with shape (N, C, H, W).")
+    batch_size, num_channels, image_height, image_width = images.shape
+    num_patches_height = image_height // patch_size
+    num_patches_width = image_width // patch_size
+    patched_image = images.reshape(
+        batch_size,
+        num_channels,
+        num_patches_height,
+        patch_size,
+        num_patches_width,
+        patch_size,
+    )
+    patched_image = patched_image.permute(0, 2, 4, 3, 5, 1)
+    return patched_image.reshape(batch_size, num_patches_height * num_patches_width, -1)
+
+
+def pad_patches(
+    patches: torch.Tensor,
+    target_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    current_length = patches.shape[0]
+    padding_length = target_length - current_length
+    patch_mask = torch.ones((target_length,), device=patches.device, dtype=torch.bool)
+    if padding_length <= 0:
+        return patches, patch_mask
+
+    padded = torch.zeros(
+        (target_length, patches.shape[1]),
+        device=patches.device,
+        dtype=patches.dtype,
+    )
+    padded[:current_length] = patches
+    patch_mask[current_length:] = False
+    return padded, patch_mask
+
+
 def resize_longest_edge(
     image_tensor: torch.Tensor,
     longest_edge: int,
@@ -230,6 +377,305 @@ def resize_longest_edge(
     resized_height = max(resized_height, 1)
     resized_width = max(resized_width, 1)
     return resize_bilinear(image_tensor, (resized_height, resized_width))
+
+
+def smart_resize_lfm2(
+    height: int,
+    width: int,
+    *,
+    downsample_factor: int,
+    min_image_tokens: int,
+    max_image_tokens: int,
+    encoder_patch_size: int,
+) -> tuple[int, int]:
+    total_factor = encoder_patch_size * downsample_factor
+    smart_resize_min_pixels = min_image_tokens * encoder_patch_size**2 * downsample_factor**2
+    smart_resize_max_pixels = max_image_tokens * encoder_patch_size**2 * downsample_factor**2
+
+    h_bar = max(total_factor, round_by_factor(height, total_factor))
+    w_bar = max(total_factor, round_by_factor(width, total_factor))
+
+    if h_bar * w_bar > smart_resize_max_pixels:
+        beta = math.sqrt((height * width) / smart_resize_max_pixels)
+        h_bar = max(total_factor, math.floor(height / beta / total_factor) * total_factor)
+        w_bar = max(total_factor, math.floor(width / beta / total_factor) * total_factor)
+    elif h_bar * w_bar < smart_resize_min_pixels:
+        beta = math.sqrt(smart_resize_min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / total_factor) * total_factor
+        w_bar = math.ceil(width * beta / total_factor) * total_factor
+
+    return w_bar, h_bar
+
+
+def is_image_too_large_lfm2(
+    height: int,
+    width: int,
+    *,
+    max_image_tokens: int,
+    encoder_patch_size: int,
+    downsample_factor: int,
+    max_pixels_tolerance: float,
+) -> bool:
+    total_factor = encoder_patch_size * downsample_factor
+    h_bar = max(encoder_patch_size, round_by_factor(height, total_factor))
+    w_bar = max(encoder_patch_size, round_by_factor(width, total_factor))
+    return (
+        h_bar * w_bar
+        > max_image_tokens * encoder_patch_size**2 * downsample_factor**2 * max_pixels_tolerance
+    )
+
+
+def pack_for_lfm2_vl(
+    image_tensor: torch.Tensor,
+    *,
+    downsample_factor: int,
+    do_image_splitting: bool,
+    min_tiles: int,
+    max_tiles: int,
+    use_thumbnail: bool,
+    min_image_tokens: int,
+    max_image_tokens: int,
+    encoder_patch_size: int,
+    tile_size: int,
+    max_pixels_tolerance: float,
+    rescale_factor: float,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not do_image_splitting:
+        min_tiles = 1
+        max_tiles = 1
+
+    max_thumbnail_image_patches = max_image_tokens * downsample_factor**2
+    tile_size_patches = (tile_size // encoder_patch_size) ** 2 if do_image_splitting else 0
+    max_num_patches = max(max_thumbnail_image_patches, tile_size_patches)
+
+    height, width = image_tensor.shape[-2:]
+    is_large = is_image_too_large_lfm2(
+        height,
+        width,
+        max_image_tokens=max_image_tokens,
+        encoder_patch_size=encoder_patch_size,
+        downsample_factor=downsample_factor,
+        max_pixels_tolerance=max_pixels_tolerance,
+    )
+    new_width, new_height = smart_resize_lfm2(
+        height,
+        width,
+        downsample_factor=downsample_factor,
+        min_image_tokens=min_image_tokens,
+        max_image_tokens=max_image_tokens,
+        encoder_patch_size=encoder_patch_size,
+    )
+
+    if is_large and min_tiles != max_tiles:
+        grid_width, grid_height = get_optimal_tiled_canvas(
+            (height, width),
+            (tile_size, tile_size),
+            min_tiles,
+            max_tiles,
+        )
+        target_width = tile_size * grid_width
+        target_height = tile_size * grid_height
+        resized_image = resize_bilinear(image_tensor, (target_height, target_width))
+        processed_images = []
+        for row in range(grid_height):
+            for column in range(grid_width):
+                top = row * tile_size
+                left = column * tile_size
+                processed_images.append(resized_image[:, top : top + tile_size, left : left + tile_size])
+        if use_thumbnail and grid_width * grid_height != 1:
+            processed_images.append(resize_bilinear(image_tensor, (new_height, new_width)))
+    else:
+        processed_images = [resize_bilinear(image_tensor, (new_height, new_width))]
+
+    pixel_values_list = []
+    pixel_attention_masks = []
+    spatial_shapes = []
+    for processed_image in processed_images:
+        normalized_image = maybe_rescale(processed_image, rescale_factor)
+        normalized_image = (normalized_image - mean.view(3, 1, 1)) / std.view(3, 1, 1)
+
+        num_patches_height = normalized_image.shape[-2] // encoder_patch_size
+        num_patches_width = normalized_image.shape[-1] // encoder_patch_size
+        patches = convert_image_to_patches_channel_first(normalized_image.unsqueeze(0), encoder_patch_size).squeeze(0)
+        patches, patch_mask = pad_patches(patches, max_num_patches)
+
+        pixel_values_list.append(patches)
+        pixel_attention_masks.append(patch_mask)
+        spatial_shapes.append([num_patches_height, num_patches_width])
+
+    pixel_values = torch.stack(pixel_values_list, dim=0)
+    pixel_attention_mask = torch.stack(pixel_attention_masks, dim=0)
+    spatial_shapes_tensor = torch.tensor(spatial_shapes, device=image_tensor.device, dtype=torch.long)
+    return pixel_values, pixel_attention_mask, spatial_shapes_tensor
+
+
+def smart_resize_jina(
+    height: int,
+    width: int,
+    *,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
+    max_absolute_aspect_ratio: int = 200,
+) -> tuple[int, int]:
+    abs_aspect_ratio = max(height, width) / min(height, width)
+    if abs_aspect_ratio > max_absolute_aspect_ratio:
+        raise ValueError(
+            f"Absolute aspect ratio must be < {max_absolute_aspect_ratio}, got {abs_aspect_ratio}"
+        )
+
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+
+    return h_bar, w_bar
+
+
+@lru_cache(maxsize=None)
+def get_molmo_tilings(max_num_crops: int) -> tuple[tuple[int, int], ...]:
+    tilings = []
+    for rows in range(1, max_num_crops + 1):
+        for columns in range(1, max_num_crops + 1):
+            if rows * columns <= max_num_crops:
+                tilings.append((rows, columns))
+    tilings.sort(key=lambda tiling: (tiling[0] * tiling[1], tiling[0]))
+    return tuple(tilings)
+
+
+def molmo_select_tiling(height: int, width: int, patch_size: int, max_num_crops: int) -> tuple[int, int]:
+    tilings = get_molmo_tilings(max_num_crops)
+    best_tiling = tilings[0]
+    best_scale = None
+    for rows, columns in tilings:
+        target_height = rows * patch_size
+        target_width = columns * patch_size
+        scale = min(target_height / height, target_width / width)
+        if best_scale is None:
+            best_scale = scale
+            best_tiling = (rows, columns)
+            continue
+        if best_scale < 1 and scale > best_scale:
+            best_scale = scale
+            best_tiling = (rows, columns)
+            continue
+        if best_scale >= 1:
+            adjusted_scale = scale if scale >= 1 else float("inf")
+            adjusted_best_scale = best_scale if best_scale >= 1 else float("inf")
+            if adjusted_scale < adjusted_best_scale:
+                best_scale = scale
+                best_tiling = (rows, columns)
+    return best_tiling
+
+
+def molmo_get_patches_from_tiling(
+    num_tiles: int,
+    pooling_size: int,
+    crop_patches: int,
+    crop_window_patches: int,
+    left_margin: int,
+    right_margin: int,
+) -> int:
+    if num_tiles > 1:
+        left_crop_window_patches = (
+            (crop_window_patches + left_margin + pooling_size - 1) // pooling_size * pooling_size
+        )
+        middle_crop_window_patches = (
+            (crop_window_patches + pooling_size - 1) // pooling_size * pooling_size
+        )
+        right_crop_window_patches = (
+            (crop_window_patches + right_margin + pooling_size - 1) // pooling_size * pooling_size
+        )
+        return (
+            left_crop_window_patches
+            + (num_tiles - 2) * middle_crop_window_patches
+            + right_crop_window_patches
+        )
+    return (crop_patches + pooling_size - 1) // pooling_size * pooling_size
+
+
+def pack_for_jina_vlm(
+    image_tensor: torch.Tensor,
+    *,
+    min_pixels: int,
+    max_pixels: int,
+    patch_size: int,
+    max_crops: int,
+    base_input_size: tuple[int, int],
+    overlap_margins: tuple[int, int],
+    pooling_w: int,
+    pooling_h: int,
+    token_length_w: int,
+    token_length_h: int,
+    use_column_tokens: bool,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = image_tensor.shape[-2:]
+    resized_height, resized_width = smart_resize_jina(
+        height,
+        width,
+        factor=patch_size,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    image_tensor = resize_bilinear(image_tensor, (resized_height, resized_width))
+
+    left_margin, right_margin = overlap_margins
+    total_margin_pixels = patch_size * (right_margin + left_margin)
+    crop_patches = base_input_size[0] // patch_size
+    crop_window_patches = crop_patches - (right_margin + left_margin)
+    crop_window_size = crop_window_patches * patch_size
+
+    tiling_rows, tiling_columns = molmo_select_tiling(
+        resized_height - total_margin_pixels,
+        resized_width - total_margin_pixels,
+        crop_window_size,
+        max_crops,
+    )
+    src = resize_bilinear(
+        image_tensor,
+        (
+            tiling_rows * crop_window_size + total_margin_pixels,
+            tiling_columns * crop_window_size + total_margin_pixels,
+        ),
+    )
+    src = (src - mean.view(3, 1, 1)) / std.view(3, 1, 1)
+    img_mask = torch.ones(src.shape[-2:], device=src.device, dtype=src.dtype)
+
+    image_base_patch_w = base_input_size[1] // patch_size
+    image_base_patch_h = base_input_size[0] // patch_size
+    crop_size = base_input_size[0]
+
+    patches_arr = []
+    mask_arr = []
+    for row in range(tiling_rows):
+        y0 = row * crop_window_size
+        for column in range(tiling_columns):
+            x0 = column * crop_window_size
+            patches_arr.append(src[:, y0 : y0 + crop_size, x0 : x0 + crop_size])
+            mask_arr.append(img_mask[y0 : y0 + crop_size, x0 : x0 + crop_size])
+
+    local_patches = torch.stack(patches_arr, dim=0)
+    local_masks = torch.stack(mask_arr, dim=0)
+    local_patches = convert_image_to_patches_channel_first(local_patches, patch_size)
+    local_masks = convert_image_to_patches_channel_first(local_masks.unsqueeze(1), patch_size).mean(dim=-1)
+
+    global_image = resize_bilinear(image_tensor, base_input_size)
+    global_image = (global_image - mean.view(3, 1, 1)) / std.view(3, 1, 1)
+    global_patches = convert_image_to_patches_channel_first(global_image.unsqueeze(0), patch_size)
+    image_patches = torch.cat([global_patches, local_patches], dim=0)
+
+    image_masks = F.pad(local_masks, (0, 0, 0, 1), value=-1.0)
+    return image_patches.unsqueeze(0), image_masks.unsqueeze(0)
 
 
 def pack_for_llava_next(
@@ -352,6 +798,19 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
     if state["model_family"] == "qwen":
         return build_qwen_vision_inputs(vision_state, image_tensor)
 
+    if state["model_family"] == "aya_vision":
+        pixel_values = pack_for_aya_vision(
+            image_tensor,
+            tile_size=vision_state["tile_size"],
+            min_patches=vision_state["min_patches"],
+            max_patches=vision_state["max_patches"],
+            rescale_factor=vision_state["rescale_factor"],
+            mean=vision_state["mean"].view(1, 3, 1, 1),
+            std=vision_state["std"].view(1, 3, 1, 1),
+            use_thumbnail=vision_state["use_thumbnail"],
+        )
+        return {"pixel_values": pixel_values}
+
     if state["model_family"] == "gemma":
         pixel_values = pack_for_gemma(
             image_tensor,
@@ -361,6 +820,28 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
             std=vision_state["std"].view(1, 3, 1, 1),
         )
         return {"pixel_values": pixel_values}
+
+    if state["model_family"] == "jina_vlm":
+        image_patches, image_masks = pack_for_jina_vlm(
+            image_tensor,
+            min_pixels=vision_state["min_pixels"],
+            max_pixels=vision_state["max_pixels"],
+            patch_size=vision_state["patch_size"],
+            max_crops=vision_state["max_crops"],
+            base_input_size=vision_state["base_input_size"],
+            overlap_margins=vision_state["overlap_margins"],
+            pooling_w=vision_state["pooling_w"],
+            pooling_h=vision_state["pooling_h"],
+            token_length_w=vision_state["token_length_w"],
+            token_length_h=vision_state["token_length_h"],
+            use_column_tokens=vision_state["use_column_tokens"],
+            mean=vision_state["mean"],
+            std=vision_state["std"],
+        )
+        return {
+            "image_patches": image_patches,
+            "image_masks": image_masks,
+        }
 
     if state["model_family"] == "llava_next":
         pixel_values, image_sizes = pack_for_llava_next(
@@ -376,6 +857,29 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
         return {
             "pixel_values": pixel_values,
             "image_sizes": image_sizes,
+        }
+
+    if state["model_family"] == "lfm2_vl":
+        pixel_values, pixel_attention_mask, spatial_shapes = pack_for_lfm2_vl(
+            image_tensor,
+            downsample_factor=vision_state["downsample_factor"],
+            do_image_splitting=vision_state["do_image_splitting"],
+            min_tiles=vision_state["min_tiles"],
+            max_tiles=vision_state["max_tiles"],
+            use_thumbnail=vision_state["use_thumbnail"],
+            min_image_tokens=vision_state["min_image_tokens"],
+            max_image_tokens=vision_state["max_image_tokens"],
+            encoder_patch_size=vision_state["encoder_patch_size"],
+            tile_size=vision_state["tile_size"],
+            max_pixels_tolerance=vision_state["max_pixels_tolerance"],
+            rescale_factor=vision_state["rescale_factor"],
+            mean=vision_state["mean"],
+            std=vision_state["std"],
+        )
+        return {
+            "pixel_values": pixel_values,
+            "pixel_attention_mask": pixel_attention_mask,
+            "spatial_shapes": spatial_shapes,
         }
 
     if state["model_family"] == "smolvlm":
@@ -417,58 +921,81 @@ def sample_camera_transform(
     if image_tensor.ndim != 3:
         raise ValueError("Expected image_tensor with shape (C, H, W).")
 
+    if (
+        rotation_degrees == 0
+        and perspective_distortion == 0
+        and crop_scale == (1.0, 1.0)
+        and crop_ratio == (1.0, 1.0)
+        and color_jitter_brightness == 0
+        and color_jitter_contrast == 0
+        and color_jitter_saturation == 0
+        and gaussian_noise_std == 0
+    ):
+        return image_tensor
+
     channels, height, width = image_tensor.shape
     fill = [1.0] * channels
 
-    startpoints, endpoints = transforms.RandomPerspective.get_params(
-        width=width,
-        height=height,
-        distortion_scale=perspective_distortion,
-    )
-    x = TF.perspective(
-        image_tensor,
-        startpoints=startpoints,
-        endpoints=endpoints,
-        interpolation=InterpolationMode.BILINEAR,
-        fill=fill,
-    )
+    x = image_tensor
 
-    top, left, crop_height, crop_width = transforms.RandomResizedCrop.get_params(
-        x,
-        scale=crop_scale,
-        ratio=crop_ratio,
-    )
-    x = TF.resized_crop(
-        x,
-        top,
-        left,
-        crop_height,
-        crop_width,
-        size=[height, width],
-        interpolation=InterpolationMode.BILINEAR,
-        antialias=True,
-    )
+    if perspective_distortion != 0:
+        startpoints, endpoints = transforms.RandomPerspective.get_params(
+            width=width,
+            height=height,
+            distortion_scale=perspective_distortion,
+        )
+        x = TF.perspective(
+            x,
+            startpoints=startpoints,
+            endpoints=endpoints,
+            interpolation=InterpolationMode.BILINEAR,
+            fill=fill,
+        )
 
-    angle = float(torch.empty(1).uniform_(-rotation_degrees, rotation_degrees).item())
-    x = TF.rotate(
-        x,
-        angle=angle,
-        interpolation=InterpolationMode.BILINEAR,
-        fill=fill,
-    )
+    if crop_scale != (1.0, 1.0) or crop_ratio != (1.0, 1.0):
+        top, left, crop_height, crop_width = transforms.RandomResizedCrop.get_params(
+            x,
+            scale=crop_scale,
+            ratio=crop_ratio,
+        )
+        x = TF.resized_crop(
+            x,
+            top,
+            left,
+            crop_height,
+            crop_width,
+            size=[height, width],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
 
-    brightness_factor = 1.0 + float(
-        torch.empty(1).uniform_(-color_jitter_brightness, color_jitter_brightness).item()
-    )
-    contrast_factor = 1.0 + float(
-        torch.empty(1).uniform_(-color_jitter_contrast, color_jitter_contrast).item()
-    )
-    saturation_factor = 1.0 + float(
-        torch.empty(1).uniform_(-color_jitter_saturation, color_jitter_saturation).item()
-    )
+    if rotation_degrees != 0:
+        angle = float(torch.empty(1).uniform_(-rotation_degrees, rotation_degrees).item())
+        x = TF.rotate(
+            x,
+            angle=angle,
+            interpolation=InterpolationMode.BILINEAR,
+            fill=fill,
+        )
 
-    x = TF.adjust_brightness(x, brightness_factor)
-    x = TF.adjust_contrast(x, contrast_factor)
-    x = TF.adjust_saturation(x, saturation_factor)
-    x = x + torch.randn_like(x) * gaussian_noise_std
+    if color_jitter_brightness != 0:
+        brightness_factor = 1.0 + float(
+            torch.empty(1).uniform_(-color_jitter_brightness, color_jitter_brightness).item()
+        )
+        x = TF.adjust_brightness(x, brightness_factor)
+
+    if color_jitter_contrast != 0:
+        contrast_factor = 1.0 + float(
+            torch.empty(1).uniform_(-color_jitter_contrast, color_jitter_contrast).item()
+        )
+        x = TF.adjust_contrast(x, contrast_factor)
+
+    if color_jitter_saturation != 0:
+        saturation_factor = 1.0 + float(
+            torch.empty(1).uniform_(-color_jitter_saturation, color_jitter_saturation).item()
+        )
+        x = TF.adjust_saturation(x, saturation_factor)
+
+    if gaussian_noise_std != 0:
+        x = x + torch.randn_like(x) * gaussian_noise_std
     return torch.clamp(x, 0.0, 1.0)

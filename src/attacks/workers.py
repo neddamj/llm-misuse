@@ -1,8 +1,11 @@
+import queue
 import traceback
+import time
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
 
 from attacks.common import canonicalize_cuda_device
 from attacks.prompting import (
@@ -14,6 +17,73 @@ from attacks.prompting import (
 from attacks.vision import build_vision_inputs, resolve_model_family
 
 
+def ensure_remote_processor_compat(model_name: str) -> None:
+    import importlib
+    import numpy as np
+    import transformers.modeling_rope_utils as rope_utils
+    import transformers.processing_utils as processing_utils
+    from transformers import AutoConfig
+
+    if not hasattr(processing_utils, "CommonKwargs"):
+        class CommonKwargs(TypedDict, total=False):
+            pass
+
+        processing_utils.CommonKwargs = CommonKwargs
+
+    if not hasattr(np, "concat"):
+        np.concat = np.concatenate
+
+    if "default" not in rope_utils.ROPE_INIT_FUNCTIONS:
+        def default_rope_init_fn(config, device=None, seq_len=None, layer_type=None):
+            base = float(getattr(config, "rope_theta"))
+            partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
+            head_dim = getattr(config, "head_dim", None)
+            if head_dim is None:
+                num_attention_heads = getattr(config, "num_attention_heads", None)
+                if num_attention_heads is None:
+                    num_attention_heads = getattr(config, "n_heads")
+                head_dim = getattr(config, "hidden_size") // num_attention_heads
+            dim = int(head_dim * partial_rotary_factor)
+            inv_freq = 1.0 / (
+                base
+                ** (
+                    torch.arange(0, dim, 2, dtype=torch.int64).to(
+                        device=device,
+                        dtype=torch.float,
+                    )
+                    / dim
+                )
+            )
+            return inv_freq, 1.0
+
+        rope_utils.ROPE_INIT_FUNCTIONS["default"] = default_rope_init_fn
+
+    if model_name == "jinaai/jina-vlm":
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        module_base = config.__class__.__module__.rsplit(".", 1)[0]
+        blocks_module = importlib.import_module(f"{module_base}.blocks_jvlm")
+        rotary_embedding_cls = blocks_module.RotaryEmbedding
+
+        if not hasattr(rotary_embedding_cls, "compute_default_rope_parameters"):
+            def compute_default_rope_parameters(
+                self,
+                config=None,
+                device=None,
+                seq_len=None,
+                layer_type=None,
+            ):
+                if config is None:
+                    config = self.config
+                return default_rope_init_fn(
+                    config,
+                    device=device,
+                    seq_len=seq_len,
+                    layer_type=layer_type,
+                )
+
+            rotary_embedding_cls.compute_default_rope_parameters = compute_default_rope_parameters
+
+
 def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
     device_name = canonicalize_cuda_device(model_spec["device"])
     device = torch.device(device_name)
@@ -21,18 +91,64 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     print(f"[Worker:{model_spec['key']}] Loading model {model_spec['model_name']} on {device_name}")
-    processor = AutoProcessor.from_pretrained(model_spec["model_name"], use_fast=False)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_spec["model_name"],
-        dtype=dtype,
-    ).to(device)
-    model.config.use_cache = False
+    trust_remote_code = bool(model_spec.get("trust_remote_code", False))
+    if trust_remote_code:
+        ensure_remote_processor_compat(model_spec["model_name"])
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_spec["model_name"],
+            use_fast=False,
+            trust_remote_code=trust_remote_code,
+        )
+    except ValueError as exc:
+        if "does not have a slow version" not in str(exc):
+            raise
+        processor = AutoProcessor.from_pretrained(
+            model_spec["model_name"],
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+        )
+
+    auto_model_class = model_spec.get("auto_model_class", "image_text_to_text")
+    if auto_model_class == "causal_lm":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_spec["model_name"],
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        ).to(device)
+    else:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_spec["model_name"],
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        ).to(device)
     model.eval()
     model.requires_grad_(False)
 
     model_family = resolve_model_family(model_spec["model_family"], model.config.model_type)
     prompt_processor_kwargs = {}
-    if model_family == "qwen":
+    vision_grad_input_key = "pixel_values"
+    if model_family == "aya_vision":
+        image_processor = processor.image_processor
+        tile_size = (
+            int(image_processor.size["height"]),
+            int(image_processor.size["width"]),
+        )
+        vision_state = {
+            "tile_size": tile_size,
+            "min_patches": int(getattr(image_processor, "min_patches", 1)),
+            "max_patches": int(getattr(image_processor, "max_patches", 12)),
+            "rescale_factor": float(getattr(image_processor, "rescale_factor", 1 / 255)),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "use_thumbnail": True,
+            "dummy_image_size": (
+                worker_config["attack_image_size"][1],
+                worker_config["attack_image_size"][0],
+            ),
+        }
+        prompt_processor_kwargs["return_mm_token_type_ids"] = True
+    elif model_family == "qwen":
         vision_config = model.config.vision_config
         vision_state = {
             "device": device,
@@ -61,6 +177,35 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             "dummy_image_size": (size[1], size[0]),
         }
         prompt_processor_kwargs["do_pan_and_scan"] = False
+    elif model_family == "jina_vlm":
+        image_processor = processor.image_processor
+        base_input_size = getattr(image_processor, "base_input_size", (378, 378))
+        if isinstance(base_input_size, list):
+            base_input_size = tuple(int(value) for value in base_input_size)
+        vision_state = {
+            "min_pixels": int(getattr(image_processor, "min_pixels")),
+            "max_pixels": int(getattr(image_processor, "max_pixels")),
+            "patch_size": int(getattr(image_processor, "patch_size")),
+            "max_crops": int(getattr(image_processor, "max_crops")),
+            "base_input_size": (
+                int(base_input_size[0]),
+                int(base_input_size[1]),
+            ),
+            "overlap_margins": tuple(int(value) for value in getattr(image_processor, "overlap_margins")),
+            "pooling_w": int(getattr(image_processor, "pooling_w")),
+            "pooling_h": int(getattr(image_processor, "pooling_h")),
+            "token_length_w": int(getattr(image_processor, "token_length_w")),
+            "token_length_h": int(getattr(image_processor, "token_length_h")),
+            "use_column_tokens": bool(getattr(image_processor, "use_column_tokens")),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "dummy_image_size": (
+                worker_config["attack_image_size"][1],
+                worker_config["attack_image_size"][0],
+            ),
+        }
+        prompt_processor_kwargs["return_mm_token_type_ids"] = True
+        vision_grad_input_key = "image_patches"
     elif model_family == "llava_next":
         image_processor = processor.image_processor
         size = image_processor.size
@@ -105,6 +250,27 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             ),
         }
         prompt_processor_kwargs["do_image_splitting"] = False
+    elif model_family == "lfm2_vl":
+        image_processor = processor.image_processor
+        vision_state = {
+            "downsample_factor": int(image_processor.downsample_factor),
+            "do_image_splitting": bool(image_processor.do_image_splitting),
+            "min_tiles": int(image_processor.min_tiles),
+            "max_tiles": int(image_processor.max_tiles),
+            "use_thumbnail": bool(image_processor.use_thumbnail),
+            "min_image_tokens": int(image_processor.min_image_tokens),
+            "max_image_tokens": int(image_processor.max_image_tokens),
+            "encoder_patch_size": int(image_processor.encoder_patch_size),
+            "tile_size": int(image_processor.tile_size),
+            "max_pixels_tolerance": float(image_processor.max_pixels_tolerance),
+            "rescale_factor": float(image_processor.rescale_factor),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "dummy_image_size": (
+                worker_config["attack_image_size"][1],
+                worker_config["attack_image_size"][0],
+            ),
+        }
     else:
         image_processor = processor.image_processor
         shortest_edge = image_processor.size.get("shortest_edge")
@@ -140,9 +306,10 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
         else []
     )
 
+    model_type = model.config.model_type
     print(
         f"[Worker:{model_spec['key']}] Ready on {device_name} "
-        f"(model_type={model.config.model_type}, family={model_family})"
+        f"(model_type={model_type}, family={model_family})"
     )
 
     return {
@@ -151,6 +318,7 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
         "processor": processor,
         "model": model,
         "model_family": model_family,
+        "vision_grad_input_key": vision_grad_input_key,
         "vision_state": vision_state,
         "prompt_text": prompt_text,
         "prompt_model_inputs": prompt_model_inputs,
@@ -170,7 +338,8 @@ def target_score(state: dict, target_batch: dict, vision_inputs: dict[str, torch
         use_cache=False,
         return_dict=True,
     )
-    shifted_logits = outputs.logits[:, :-1, :]
+    logits = outputs.logits
+    shifted_logits = logits[:, :-1, :]
     shifted_labels = target_batch["labels"][:, 1:]
     valid_mask = shifted_labels != -100
     safe_labels = shifted_labels.masked_fill(~valid_mask, 0)
@@ -181,32 +350,15 @@ def target_score(state: dict, target_batch: dict, vision_inputs: dict[str, torch
     return -avg_nll
 
 
-def compute_target_pixel_values_grad(
+def build_vision_grad_inputs(
     state: dict,
-    target_batch: dict,
     vision_inputs: dict[str, torch.Tensor],
-    *,
-    weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    pixel_values_ref = vision_inputs["pixel_values"].detach().requires_grad_(True)
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    vision_grad_input_key = state["vision_grad_input_key"]
+    pixel_values_ref = vision_inputs[vision_grad_input_key].detach().requires_grad_(True)
     vision_inputs_ref = dict(vision_inputs)
-    vision_inputs_ref["pixel_values"] = pixel_values_ref
-    score = target_score(state, target_batch, vision_inputs_ref)
-    if weight is not None:
-        score = weight * score
-    return torch.autograd.grad(-score, pixel_values_ref)[0]
-
-
-def compute_untargeted_reference_pixel_values_grad(
-    state: dict,
-    reference_batch: dict,
-    vision_inputs: dict[str, torch.Tensor],
-) -> torch.Tensor:
-    pixel_values_ref = vision_inputs["pixel_values"].detach().requires_grad_(True)
-    vision_inputs_ref = dict(vision_inputs)
-    vision_inputs_ref["pixel_values"] = pixel_values_ref
-    score = target_score(state, reference_batch, vision_inputs_ref)
-    return torch.autograd.grad(score, pixel_values_ref)[0]
+    vision_inputs_ref[vision_grad_input_key] = pixel_values_ref
+    return pixel_values_ref, vision_inputs_ref
 
 
 def target_loss(
@@ -217,41 +369,36 @@ def target_loss(
 ) -> torch.Tensor:
     if state["target_loss_mode"] == "standard_ce":
         target_batch = state["target_batches"][0]
-        with torch.no_grad():
-            loss = -target_score(state, target_batch, vision_inputs)
-
         if not backward:
-            return loss
+            with torch.no_grad():
+                return -target_score(state, target_batch, vision_inputs)
 
-        grad = compute_target_pixel_values_grad(state, target_batch, vision_inputs)
-        vision_inputs["pixel_values"].backward(grad)
-        return loss
-
-    with torch.no_grad():
-        detached_scores = torch.stack(
-            [target_score(state, target_batch, vision_inputs) for target_batch in state["target_batches"]]
-        )
-        aggregate_loss = -(
-            torch.logsumexp(detached_scores, dim=0) - detached_scores.new_tensor(len(state["target_batches"])).log()
-        )
+        pixel_values_ref, vision_inputs_ref = build_vision_grad_inputs(state, vision_inputs)
+        loss = -target_score(state, target_batch, vision_inputs_ref)
+        vision_grad_input_key = state["vision_grad_input_key"]
+        grad = torch.autograd.grad(loss, pixel_values_ref)[0]
+        vision_inputs[vision_grad_input_key].backward(grad)
+        return loss.detach()
 
     if not backward:
-        return aggregate_loss
-
-    weights = torch.softmax(detached_scores, dim=0)
-    pixel_values_grad = torch.zeros_like(vision_inputs["pixel_values"])
-    for weight, target_batch in zip(weights, state["target_batches"]):
-        pixel_values_grad.add_(
-            compute_target_pixel_values_grad(
-                state,
-                target_batch,
-                vision_inputs,
-                weight=weight,
+        with torch.no_grad():
+            detached_scores = torch.stack(
+                [target_score(state, target_batch, vision_inputs) for target_batch in state["target_batches"]]
             )
-        )
+            return -(
+                torch.logsumexp(detached_scores, dim=0)
+                - detached_scores.new_tensor(len(state["target_batches"])).log()
+            )
 
-    vision_inputs["pixel_values"].backward(pixel_values_grad)
-    return aggregate_loss
+    pixel_values_ref, vision_inputs_ref = build_vision_grad_inputs(state, vision_inputs)
+    scores = torch.stack(
+        [target_score(state, target_batch, vision_inputs_ref) for target_batch in state["target_batches"]]
+    )
+    aggregate_loss = -(torch.logsumexp(scores, dim=0) - scores.new_tensor(len(state["target_batches"])).log())
+    vision_grad_input_key = state["vision_grad_input_key"]
+    pixel_values_grad = torch.autograd.grad(aggregate_loss, pixel_values_ref)[0]
+    vision_inputs[vision_grad_input_key].backward(pixel_values_grad)
+    return aggregate_loss.detach()
 
 
 def untargeted_reference_loss(
@@ -264,16 +411,18 @@ def untargeted_reference_loss(
     if reference_batch is None:
         raise RuntimeError("Untargeted mode requires a clean reference generation before evaluation or attack.")
 
-    with torch.no_grad():
-        metric_loss = -target_score(state, reference_batch, vision_inputs)
-        optimization_loss = -metric_loss
-
     if not backward:
-        return metric_loss, optimization_loss
+        with torch.no_grad():
+            metric_loss = -target_score(state, reference_batch, vision_inputs)
+            return metric_loss, -metric_loss
 
-    grad = compute_untargeted_reference_pixel_values_grad(state, reference_batch, vision_inputs)
-    vision_inputs["pixel_values"].backward(grad)
-    return metric_loss, optimization_loss
+    pixel_values_ref, vision_inputs_ref = build_vision_grad_inputs(state, vision_inputs)
+    optimization_loss = target_score(state, reference_batch, vision_inputs_ref)
+    metric_loss = -optimization_loss
+    vision_grad_input_key = state["vision_grad_input_key"]
+    grad = torch.autograd.grad(optimization_loss, pixel_values_ref)[0]
+    vision_inputs[vision_grad_input_key].backward(grad)
+    return metric_loss.detach(), optimization_loss.detach()
 
 
 def attack_loss(
@@ -297,26 +446,38 @@ def generate_from_image(state: dict, image_tensor: torch.Tensor) -> str:
         state["prompt_token_count"],
         vision_inputs,
         max_new_tokens=state["max_new_tokens"],
+        use_cache=True,
     )
+
+
+def evaluate_metric_loss(state: dict, image_gpu: torch.Tensor) -> float | None:
+    if state["attack_mode"] != "targeted" and state["untargeted_reference_batch"] is None:
+        return None
+
+    vision_inputs = build_vision_inputs(state, image_gpu)
+    metric_loss, _ = attack_loss(state, vision_inputs)
+    return float(metric_loss.item())
 
 
 def evaluate_image(state: dict, image_cpu: torch.Tensor) -> dict:
     image_gpu = image_cpu.to(state["device"], non_blocking=True).squeeze(0)
     with torch.no_grad():
         generation = generate_from_image(state, image_gpu)
-        loss = None
-        if state["attack_mode"] == "targeted" or state["untargeted_reference_batch"] is not None:
-            vision_inputs = build_vision_inputs(state, image_gpu)
-            metric_loss, _ = attack_loss(state, vision_inputs)
-            loss = float(metric_loss.item())
-    return {
-        "loss": loss,
-        "generation": generation,
-    }
+        loss = evaluate_metric_loss(state, image_gpu)
+    return {"loss": loss, "generation": generation}
+
+
+def evaluate_image_loss_only(state: dict, image_cpu: torch.Tensor) -> dict:
+    image_gpu = image_cpu.to(state["device"], non_blocking=True).squeeze(0)
+    with torch.no_grad():
+        loss = evaluate_metric_loss(state, image_gpu)
+    if loss is None:
+        raise RuntimeError("Loss-only evaluation requires a target or untargeted reference batch.")
+    return {"loss": loss}
 
 
 def attack_step(state: dict, image_cpu: torch.Tensor) -> dict:
-    x_adv = image_cpu.to(state["device"], non_blocking=True).detach().clone().requires_grad_(True)
+    x_adv = image_cpu.to(state["device"], non_blocking=True).requires_grad_(True)
     vision_inputs = build_vision_inputs(state, x_adv.squeeze(0))
     metric_loss, optimization_loss = attack_loss(state, vision_inputs, backward=True)
     if x_adv.grad is None:
@@ -352,8 +513,19 @@ def worker_main(model_spec: dict, worker_config: dict, request_queue, response_q
                 response_queue.put({"type": "attack_step", "key": model_spec["key"], **result})
                 continue
             if command == "evaluate":
+                print(f"[Worker:{model_spec['key']}] Starting evaluate", flush=True)
+                started_at = time.perf_counter()
                 result = evaluate_image(state, message["image"])
                 response_queue.put({"type": "evaluate", "key": model_spec["key"], **result})
+                elapsed = time.perf_counter() - started_at
+                print(
+                    f"[Worker:{model_spec['key']}] Finished evaluate in {elapsed:.1f}s",
+                    flush=True,
+                )
+                continue
+            if command == "evaluate_loss_only":
+                result = evaluate_image_loss_only(state, message["image"])
+                response_queue.put({"type": "evaluate_loss_only", "key": model_spec["key"], **result})
                 continue
             if command == "set_untargeted_reference":
                 reference_text = message["reference_text"]
@@ -399,17 +571,66 @@ def dispatch_worker_command(
     *,
     expected_type: str,
 ) -> list[dict]:
-    image_cpu = image_cpu.detach().cpu().contiguous()
+    image_cpu = image_cpu.detach()
+    if image_cpu.device.type != "cpu":
+        image_cpu = image_cpu.cpu()
+    if not image_cpu.is_contiguous():
+        image_cpu = image_cpu.contiguous()
     for worker in workers:
         worker["request_queue"].put({"command": command, "image": image_cpu})
-    messages = [receive_message(worker) for worker in workers]
-    for worker, message in zip(workers, messages):
-        if message["type"] != expected_type:
-            raise RuntimeError(
-                f"Expected {expected_type} result from {worker['model_spec']['key']}, "
-                f"got {message['type']!r}."
+
+    total_workers = len(workers)
+    pending_workers = {
+        worker["model_spec"]["key"]: worker
+        for worker in workers
+    }
+    messages_by_key = {}
+    started_at = time.perf_counter()
+    last_status_at = started_at
+
+    while pending_workers:
+        progress_made = False
+        for key, worker in list(pending_workers.items()):
+            try:
+                message = worker["response_queue"].get_nowait()
+            except queue.Empty:
+                if not worker["process"].is_alive():
+                    raise RuntimeError(
+                        f"Worker {key} exited before sending a {expected_type!r} response."
+                    )
+                continue
+
+            progress_made = True
+            if message["type"] == "error":
+                raise RuntimeError(f"Worker {key} failed:\n{message['message']}")
+            if message["type"] != expected_type:
+                raise RuntimeError(
+                    f"Expected {expected_type} result from {key}, got {message['type']!r}."
+                )
+
+            messages_by_key[key] = message
+            pending_workers.pop(key)
+            if command != "attack_step":
+                print(
+                    f"[Info] Received {command} result from {key} "
+                    f"({len(messages_by_key)}/{total_workers})",
+                    flush=True,
+                )
+
+        now = time.perf_counter()
+        if command != "attack_step" and pending_workers and now - last_status_at >= 10.0:
+            pending_list = ", ".join(sorted(pending_workers))
+            print(
+                f"[Info] Waiting for {command} results from: {pending_list} "
+                f"({now - started_at:.1f}s elapsed)",
+                flush=True,
             )
-    return messages
+            last_status_at = now
+
+        if not progress_made:
+            time.sleep(0.1)
+
+    return [messages_by_key[worker["model_spec"]["key"]] for worker in workers]
 
 
 def start_workers(ctx, model_specs: list[dict], worker_config: dict) -> list[dict]:
@@ -475,6 +696,18 @@ def evaluate_workers(workers: list[dict], image_cpu: torch.Tensor) -> dict[str, 
             "generation": message["generation"],
         }
         for message in dispatch_worker_command(workers, "evaluate", image_cpu, expected_type="evaluate")
+    }
+
+
+def evaluate_workers_loss_only(workers: list[dict], image_cpu: torch.Tensor) -> dict[str, float]:
+    return {
+        message["key"]: message["loss"]
+        for message in dispatch_worker_command(
+            workers,
+            "evaluate_loss_only",
+            image_cpu,
+            expected_type="evaluate_loss_only",
+        )
     }
 
 

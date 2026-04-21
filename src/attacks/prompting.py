@@ -2,21 +2,28 @@ from PIL import Image
 import torch
 
 
+TEXT_MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "position_ids")
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
+STATIC_MULTIMODAL_INPUT_KEYS = ("image_input_idx",)
 
 
 def build_text_model_inputs(
     prompt_inputs: dict[str, torch.Tensor],
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    model_inputs = {
-        "input_ids": prompt_inputs["input_ids"].to(device),
-        "attention_mask": prompt_inputs["attention_mask"].to(device),
-    }
+    model_inputs = {}
+    for input_key in TEXT_MODEL_INPUT_KEYS:
+        input_value = prompt_inputs.get(input_key)
+        if input_value is not None:
+            model_inputs[input_key] = input_value.to(device)
     for token_type_key in TOKEN_TYPE_INPUT_KEYS:
         token_type_ids = prompt_inputs.get(token_type_key)
         if token_type_ids is not None:
             model_inputs[token_type_key] = token_type_ids.to(device)
+    for static_key in STATIC_MULTIMODAL_INPUT_KEYS:
+        static_value = prompt_inputs.get(static_key)
+        if static_value is not None:
+            model_inputs[static_key] = static_value.to(device)
     return model_inputs
 
 
@@ -63,6 +70,16 @@ def build_teacher_forced_batch(
         "input_ids": torch.cat([prompt_model_inputs["input_ids"], target_ids], dim=1),
         "attention_mask": torch.cat([prompt_model_inputs["attention_mask"], torch.ones_like(target_ids)], dim=1),
     }
+    position_ids = prompt_model_inputs.get("position_ids")
+    if position_ids is not None:
+        next_position = int(position_ids[0, -1].item()) + 1 if position_ids.numel() > 0 else 0
+        target_position_ids = torch.arange(
+            next_position,
+            next_position + target_ids.shape[1],
+            device=device,
+            dtype=position_ids.dtype,
+        ).unsqueeze(0)
+        full_model_inputs["position_ids"] = torch.cat([position_ids, target_position_ids], dim=1)
     for token_type_key in TOKEN_TYPE_INPUT_KEYS:
         token_type_ids = prompt_model_inputs.get(token_type_key)
         if token_type_ids is not None:
@@ -73,6 +90,10 @@ def build_teacher_forced_batch(
                 ],
                 dim=1,
             )
+    for static_key in STATIC_MULTIMODAL_INPUT_KEYS:
+        static_value = prompt_model_inputs.get(static_key)
+        if static_value is not None:
+            full_model_inputs[static_key] = static_value
 
     labels = full_model_inputs["input_ids"].clone()
     labels[:, : prompt_model_inputs["input_ids"].shape[1]] = -100
@@ -114,12 +135,14 @@ def generate_greedy_text(
     vision_inputs: dict[str, torch.Tensor],
     *,
     max_new_tokens: int,
+    use_cache: bool = True,
 ) -> str:
     generated = model.generate(
         **prompt_model_inputs,
         **vision_inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        use_cache=use_cache,
     )
     new_tokens = generated[:, prompt_token_count:]
     return processor.batch_decode(
