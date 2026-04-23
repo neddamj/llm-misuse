@@ -23,6 +23,7 @@ from attacks.vision import build_vision_inputs, resolve_model_family
 
 
 def ensure_remote_processor_compat(model_name: str) -> None:
+    # Keep remote processor/model code working across transformer/numpy version mismatches.
     import importlib
     import numpy as np
     import transformers.modeling_rope_utils as rope_utils
@@ -30,15 +31,18 @@ def ensure_remote_processor_compat(model_name: str) -> None:
     from transformers import AutoConfig
 
     if not hasattr(processing_utils, "CommonKwargs"):
+        # Some remote processors still import this older typing alias.
         class CommonKwargs(TypedDict, total=False):
             pass
 
         processing_utils.CommonKwargs = CommonKwargs
 
     if not hasattr(np, "concat"):
+        # Backfill alias expected by some remote repos.
         np.concat = np.concatenate
 
     if "default" not in rope_utils.ROPE_INIT_FUNCTIONS:
+        # Remote rotary implementations can expect a "default" rope initializer to exist.
         def default_rope_init_fn(config, device=None, seq_len=None, layer_type=None):
             base = float(getattr(config, "rope_theta"))
             partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
@@ -391,6 +395,7 @@ def build_vision_grad_inputs(
     vision_inputs: dict[str, torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     vision_grad_input_key = state["vision_grad_input_key"]
+    # Different models expose differentiable image inputs under different keys.
     pixel_values_ref = vision_inputs[vision_grad_input_key].detach().requires_grad_(True)
     vision_inputs_ref = dict(vision_inputs)
     vision_inputs_ref[vision_grad_input_key] = pixel_values_ref
@@ -407,6 +412,7 @@ def target_loss(
         target_batch = state["target_batches"][0]
         if not backward:
             with torch.no_grad():
+                # `target_score` is negative NLL, so minimizing target loss is `-target_score`.
                 return -target_score(state, target_batch, vision_inputs)
 
         pixel_values_ref, vision_inputs_ref = build_vision_grad_inputs(state, vision_inputs)
@@ -421,6 +427,7 @@ def target_loss(
             detached_scores = torch.stack(
                 [target_score(state, target_batch, vision_inputs) for target_batch in state["target_batches"]]
             )
+            # Multi-reference mode uses log-mean-exp over target scores for a smooth aggregate objective.
             return -(
                 torch.logsumexp(detached_scores, dim=0)
                 - detached_scores.new_tensor(len(state["target_batches"])).log()
@@ -450,6 +457,7 @@ def untargeted_reference_loss(
     if not backward:
         with torch.no_grad():
             metric_loss = -target_score(state, reference_batch, vision_inputs)
+            # Reported metric is NLL on the clean reference, while optimization maximizes that NLL.
             return metric_loss, -metric_loss
 
     pixel_values_ref, vision_inputs_ref = build_vision_grad_inputs(state, vision_inputs)
@@ -628,9 +636,11 @@ def dispatch_worker_command(
         progress_made = False
         for key, worker in list(pending_workers.items()):
             try:
+                # Poll non-blocking so one slow worker does not stall checks for the others.
                 message = worker["response_queue"].get_nowait()
             except queue.Empty:
                 if not worker["process"].is_alive():
+                    # Surface dead workers immediately instead of waiting for a queue timeout.
                     raise RuntimeError(
                         f"Worker {key} exited before sending a {expected_type!r} response."
                     )

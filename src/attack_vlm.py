@@ -84,7 +84,7 @@ CLIP_MODEL_SPECS = [
     },
 ]
 
-img_idx = 15
+img_idx = 6
 SPEC = "clip" # Options: "siglip2", "siglip", "clip_vl"
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / f"{img_idx}.png"
 USER_PROMPT = "Solve the problems shown in the image. Show steps and give the final answers."
@@ -231,6 +231,7 @@ def compute_cross_model_aggregation(
     if not ordered_keys or not gradients:
         raise RuntimeError("Expected at least one worker result for cross-model aggregation.")
 
+    # `metric_losses_by_key` is for reporting; `optimization_losses_by_key` determines update direction.
     if CROSS_MODEL_OPTIMIZATION_MODE == "mean_ce":
         aggregated_grad = None
         optimization_loss_sum = 0.0
@@ -270,6 +271,7 @@ def compute_cross_model_aggregation(
         dtype=dtype,
     )
     stacked_grads = torch.stack(gradients, dim=0).to(device=device, dtype=dtype)
+    # "Worst" follows the optimization objective so progress and aggregation stay aligned.
     worst_index = int(torch.argmax(optimization_losses).item())
 
     if CROSS_MODEL_OPTIMIZATION_MODE == "softminimax":
@@ -278,6 +280,7 @@ def compute_cross_model_aggregation(
             device=device,
             dtype=dtype,
         )
+        # Softminimax smoothly prioritizes higher-loss models instead of hard-switching to max.
         weights = torch.softmax(optimization_losses / temperature, dim=0)
         weight_shape = (len(ordered_keys),) + (1,) * (stacked_grads.ndim - 1)
         aggregated_grad = (stacked_grads * weights.view(weight_shape)).sum(dim=0)
@@ -369,6 +372,7 @@ def get_metric_loss_label() -> str:
 
 
 def should_update_progress(step_index: int) -> bool:
+    # Limit tqdm postfix churn; still report the first and last step.
     return (
         step_index == 0
         or step_index == STEPS - 1
@@ -406,6 +410,7 @@ def run_eot_attack_step(
             device=delta.device,
             dtype=delta.dtype,
         )
+        # Backpropagate worker gradients through the sampled camera transform.
         transformed_image.backward(aggregated_grad)
         eot_aggregate_loss += sample_aggregate_loss
         for key, loss in step_results.items():
@@ -416,6 +421,7 @@ def run_eot_attack_step(
 
     x_adv_leaf.grad.div_(EOT_TRAIN_SAMPLES)
     x_adv_live = torch.clamp(x_clean + delta, 0.0, 1.0)
+    # Transfer averaged EoT image-space gradients onto `delta` through the unclipped attack graph.
     x_adv_live.backward(x_adv_leaf.grad)
     return (
         {key: eot_loss_sums[key] / EOT_TRAIN_SAMPLES for key in eot_loss_sums},

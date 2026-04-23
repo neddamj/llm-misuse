@@ -52,6 +52,7 @@ def run_pgd(
         project_delta(delta, x_clean, EPSILON)
     delta.requires_grad_(True)
 
+    # Guard against silent failures where quantization or preprocessing blocks gradient flow.
     saw_nonzero_grad = False
     last_loss = 0.0
     last_grad_inf = 0.0
@@ -73,6 +74,7 @@ def run_pgd(
         saw_nonzero_grad = saw_nonzero_grad or grad_inf > 0.0
 
         with torch.no_grad():
+            # PGD ascent on transcription loss, then project back into the L_inf epsilon ball.
             delta.add_(ALPHA * grad.sign())
             project_delta(delta, x_clean, EPSILON)
 
@@ -81,6 +83,7 @@ def run_pgd(
         progress.set_postfix(loss=f"{last_loss:.4f}", grad_inf=f"{last_grad_inf:.6f}")
 
     if not saw_nonzero_grad:
+        # Failing early here avoids writing artifacts from a no-op attack.
         raise RuntimeError("PGD never observed a non-zero image gradient.")
 
     x_final = torch.clamp(x_clean + delta.detach(), 0.0, 1.0)
@@ -206,6 +209,7 @@ def main() -> None:
     teacher_forced_batch = build_teacher_forced_batch(
         processor.tokenizer,
         prompt_model_inputs,
+        # Reuse the clean transcript so PGD can explicitly maximize error against the model's own baseline text.
         clean_text,
         device,
     )

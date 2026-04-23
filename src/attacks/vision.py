@@ -98,6 +98,7 @@ def pack_for_qwen(
 
     frames = x.unsqueeze(0)
     if frames.shape[0] % temporal_patch_size != 0:
+        # Qwen expects the temporal axis to align to `temporal_patch_size`.
         repeats = temporal_patch_size - (frames.shape[0] % temporal_patch_size)
         frames = torch.cat([frames, frames[-1:].repeat(repeats, 1, 1, 1)], dim=0)
 
@@ -106,6 +107,7 @@ def pack_for_qwen(
     grid_h = frames.shape[2] // patch_size
     grid_w = frames.shape[3] // patch_size
 
+    # Reshape into Qwen's merged temporal/spatial patch order before flattening per token.
     patches = frames.reshape(
         grid_t,
         temporal_patch_size,
@@ -448,6 +450,7 @@ def pack_for_lfm2_vl(
         min_tiles = 1
         max_tiles = 1
 
+    # Keep every crop padded to a shared patch length so batches stay stackable.
     max_thumbnail_image_patches = max_image_tokens * downsample_factor**2
     tile_size_patches = (tile_size // encoder_patch_size) ** 2 if do_image_splitting else 0
     max_num_patches = max(max_thumbnail_image_patches, tile_size_patches)
@@ -471,6 +474,7 @@ def pack_for_lfm2_vl(
     )
 
     if is_large and min_tiles != max_tiles:
+        # Very large images are split into tiles; optional thumbnail preserves global context.
         grid_width, grid_height = get_optimal_tiled_canvas(
             (height, width),
             (tile_size, tile_size),
@@ -671,11 +675,13 @@ def pack_for_jina_vlm(
     local_patches = convert_image_to_patches_channel_first(local_patches, patch_size)
     local_masks = convert_image_to_patches_channel_first(local_masks.unsqueeze(1), patch_size).mean(dim=-1)
 
+    # Prepend a global crop, then append local tiled crops for the full Jina input sequence.
     global_image = resize_bilinear(image_tensor, base_input_size)
     global_image = (global_image - mean.view(3, 1, 1)) / std.view(3, 1, 1)
     global_patches = convert_image_to_patches_channel_first(global_image.unsqueeze(0), patch_size)
     image_patches = torch.cat([global_patches, local_patches], dim=0)
 
+    # Extra mask row aligns with the prepended global patch block.
     image_masks = F.pad(local_masks, (0, 0, 0, 1), value=-1.0)
     return image_patches.unsqueeze(0), image_masks.unsqueeze(0)
 
@@ -730,9 +736,11 @@ def pack_for_llava_next(
     padded_image = F.pad(padded_image, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
 
     patch_size = crop_size[0]
+    # Build local high-resolution crops from the padded best-fit canvas.
     patches = padded_image.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)
     patches = patches.permute(1, 2, 0, 3, 4).contiguous().view(-1, image_tensor.shape[0], patch_size, patch_size)
 
+    # LLaVA-Next consumes one global image plus a set of local crops.
     global_image = resize_bilinear(image_tensor, resize_size)
     global_image = center_crop_or_pad(global_image, crop_size).unsqueeze(0)
 
@@ -956,6 +964,7 @@ def sample_camera_transform(
         and color_jitter_saturation == 0
         and gaussian_noise_std == 0
     ):
+        # Fast path for deterministic runs with EoT disabled.
         return image_tensor
 
     channels, height, width = image_tensor.shape
@@ -963,6 +972,7 @@ def sample_camera_transform(
 
     x = image_tensor
 
+    # Apply geometric transforms first, then photometric noise; keep final values in [0, 1].
     if perspective_distortion != 0:
         startpoints, endpoints = transforms.RandomPerspective.get_params(
             width=width,
