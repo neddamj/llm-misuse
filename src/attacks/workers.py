@@ -5,7 +5,12 @@ from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    InstructBlipProcessor,
+)
 
 from attacks.common import canonicalize_cuda_device
 from attacks.prompting import (
@@ -109,6 +114,24 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             trust_remote_code=trust_remote_code,
         )
 
+    if (
+        model_spec.get("model_family") == "instructblip"
+        and not hasattr(processor, "image_processor")
+    ):
+        try:
+            processor = InstructBlipProcessor.from_pretrained(
+                model_spec["model_name"],
+                trust_remote_code=trust_remote_code,
+            )
+        except ValueError as exc:
+            if "does not have a slow version" not in str(exc):
+                raise
+            processor = InstructBlipProcessor.from_pretrained(
+                model_spec["model_name"],
+                use_fast=True,
+                trust_remote_code=trust_remote_code,
+            )
+
     auto_model_class = model_spec.get("auto_model_class", "image_text_to_text")
     if auto_model_class == "causal_lm":
         model = AutoModelForCausalLM.from_pretrained(
@@ -177,6 +200,19 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             "dummy_image_size": (size[1], size[0]),
         }
         prompt_processor_kwargs["do_pan_and_scan"] = False
+    elif model_family == "instructblip":
+        image_processor = processor.image_processor
+        size = (
+            int(image_processor.size["height"]),
+            int(image_processor.size["width"]),
+        )
+        vision_state = {
+            "size": size,
+            "rescale_factor": float(image_processor.rescale_factor),
+            "mean": torch.tensor(image_processor.image_mean, device=device),
+            "std": torch.tensor(image_processor.image_std, device=device),
+            "dummy_image_size": (size[1], size[0]),
+        }
     elif model_family == "jina_vlm":
         image_processor = processor.image_processor
         base_input_size = getattr(image_processor, "base_input_size", (378, 378))

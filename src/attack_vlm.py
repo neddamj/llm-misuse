@@ -69,8 +69,23 @@ SIGLIP_MODEL_SPECS = [
     },
 ]
 
+CLIP_MODEL_SPECS = [
+    {
+        "key": "llava_1_5_7b_hf",
+        "model_name": "llava-hf/llava-1.5-7b-hf",
+        "model_family": "auto",
+        "device": "cuda:0",
+    },
+    {
+        "key": "instructblip_vicuna_7b",
+        "model_name": "Salesforce/instructblip-vicuna-7b",
+        "model_family": "instructblip",
+        "device": "cuda:1",
+    },
+]
+
 img_idx = 15
-SPEC = "siglip" # Options: "siglip2", "siglip"
+SPEC = "clip" # Options: "siglip2", "siglip", "clip_vl"
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / f"{img_idx}.png"
 USER_PROMPT = "Solve the problems shown in the image. Show steps and give the final answers."
 ATTACK_MODE = "untargeted" # Options: "targeted", "untargeted"
@@ -119,9 +134,11 @@ if SPEC == "siglip2":
     MODEL_SPECS = SIGLIP2_MODEL_SPECS
 elif SPEC == "siglip":
     MODEL_SPECS = SIGLIP_MODEL_SPECS
+elif SPEC == "clip":
+    MODEL_SPECS = CLIP_MODEL_SPECS
 else:
     raise ValueError(
-        f"SPEC must be one of: 'siglip2', 'siglip'. Got {SPEC!r}."
+        f"SPEC must be one of: 'siglip2', 'siglip', 'clip'. Got {SPEC!r}."
     )
 
 def save_noise_visualization(delta: torch.Tensor, output_path: Path) -> None:

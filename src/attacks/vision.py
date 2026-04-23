@@ -11,6 +11,7 @@ from torchvision.transforms import functional as TF
 SUPPORTED_MODEL_TYPES = {
     "aya_vision": "aya_vision",
     "gemma3": "gemma",
+    "instructblip": "instructblip",
     "jvlm": "jina_vlm",
     "idefics3": "smolvlm",
     "lfm2_vl": "lfm2_vl",
@@ -28,6 +29,7 @@ def resolve_model_family(requested_model_family: str, model_type: str) -> str:
         "auto",
         "aya_vision",
         "gemma",
+        "instructblip",
         "jina_vlm",
         "lfm2_vl",
         "qwen",
@@ -37,7 +39,7 @@ def resolve_model_family(requested_model_family: str, model_type: str) -> str:
     }:
         raise ValueError(
             "MODEL_FAMILY must be one of: "
-            "'auto', 'aya_vision', 'gemma', 'jina_vlm', 'lfm2_vl', "
+            "'auto', 'aya_vision', 'gemma', 'instructblip', 'jina_vlm', 'lfm2_vl', "
             "'qwen', 'llava', 'llava_next', 'smolvlm'."
         )
 
@@ -793,6 +795,19 @@ def pack_for_gemma(
     return (x - mean) / std
 
 
+def pack_for_instructblip(
+    image_tensor: torch.Tensor,
+    *,
+    size: tuple[int, int],
+    rescale_factor: float,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    x = resize_bilinear(image_tensor, size).unsqueeze(0)
+    x = maybe_rescale(x, rescale_factor)
+    return (x - mean) / std
+
+
 def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
     vision_state = state["vision_state"]
     if state["model_family"] == "qwen":
@@ -813,6 +828,16 @@ def build_vision_inputs(state: dict, image_tensor: torch.Tensor) -> dict[str, to
 
     if state["model_family"] == "gemma":
         pixel_values = pack_for_gemma(
+            image_tensor,
+            size=vision_state["size"],
+            rescale_factor=vision_state["rescale_factor"],
+            mean=vision_state["mean"].view(1, 3, 1, 1),
+            std=vision_state["std"].view(1, 3, 1, 1),
+        )
+        return {"pixel_values": pixel_values}
+
+    if state["model_family"] == "instructblip":
+        pixel_values = pack_for_instructblip(
             image_tensor,
             size=vision_state["size"],
             rescale_factor=vision_state["rescale_factor"],

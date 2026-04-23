@@ -4,7 +4,11 @@ import torch
 
 TEXT_MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "position_ids")
 TOKEN_TYPE_INPUT_KEYS = ("mm_token_type_ids", "token_type_ids")
-STATIC_MULTIMODAL_INPUT_KEYS = ("image_input_idx",)
+STATIC_MULTIMODAL_INPUT_KEYS = (
+    "image_input_idx",
+    "qformer_input_ids",
+    "qformer_attention_mask",
+)
 
 
 def build_text_model_inputs(
@@ -43,7 +47,17 @@ def build_chat_prompt_inputs(
             ],
         }
     ]
-    rendered_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    rendered_prompt = prompt
+    if hasattr(processor, "apply_chat_template"):
+        try:
+            rendered_prompt = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except ValueError as exc:
+            if "does not have a chat template" not in str(exc):
+                raise
     dummy_image = Image.new("RGB", dummy_image_size, color="white")
     prompt_inputs = processor(
         text=[rendered_prompt],
