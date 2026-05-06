@@ -335,6 +335,17 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
         vision_state["dummy_image_size"],
         **prompt_processor_kwargs,
     )
+    if model_family == "gemma":
+        torch_version = tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2])
+        if torch_version < (2, 6):
+            # Gemma 3 token_type_ids trigger Transformers' image bidirectional mask path,
+            # which requires torch>=2.6 in current Transformers releases.
+            for token_type_key in ("mm_token_type_ids", "token_type_ids"):
+                prompt_model_inputs.pop(token_type_key, None)
+            print(
+                f"[Worker:{model_spec['key']}] Disabled Gemma token_type_ids "
+                f"for torch {torch.__version__}; torch>=2.6 is required for that mask path."
+            )
     target_batches = (
         build_target_batches(
             processor.tokenizer,
