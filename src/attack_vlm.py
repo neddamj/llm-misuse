@@ -50,14 +50,14 @@ SIGLIP2_MODEL_SPECS = [
 
 SIGLIP_MODEL_SPECS = [
     {
-        "key": "granite_vision_3_2",
-        "model_name": "ibm-granite/granite-vision-3.2-2b",
+        "key": "gemma3_4b_it",
+        "model_name": "google/gemma-3-4b-it",
         "model_family": "auto",
         "device": "cuda:0",
     },
     {
-        "key": "gemma3_4b_it",
-        "model_name": "google/gemma-3-4b-it",
+        "key": "granite_vision_3_2",
+        "model_name": "ibm-granite/granite-vision-3.2-2b",
         "model_family": "auto",
         "device": "cuda:1",
     },
@@ -85,7 +85,7 @@ CLIP_MODEL_SPECS = [
 ]
 
 img_idx = 6
-SPEC = "clip" # Options: "siglip2", "siglip", "clip_vl"
+SPEC = "clip" # Options: "siglip2", "siglip", "clip"
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / f"{img_idx}.png"
 USER_PROMPT = "Solve the problems shown in the image. Show steps and give the final answers."
 ATTACK_MODE = "untargeted" # Options: "targeted", "untargeted"
@@ -98,7 +98,7 @@ TARGET_TEXTS: list[str] = [
 TARGET_LOSS_MODE = "standard_ce" # Options: "standard_ce", "multi_reference"
 CROSS_MODEL_OPTIMIZATION_MODE = "mean_ce" # Options: "mean_ce", "softminimax"
 
-NUM, DEN = 32, 255
+NUM, DEN = 64, 255
 EPSILON = NUM / DEN
 ALPHA = 4 / 1000
 STEPS = 1500
@@ -119,7 +119,7 @@ EOT_COLOR_JITTER_CONTRAST = 0.1
 EOT_COLOR_JITTER_SATURATION = 0.1
 EOT_GAUSSIAN_NOISE_STD = 0.02
 
-RESULT_PREFIX = "vlm_textgen_multi_gpu"
+RESULT_PREFIX = "llava_textgen_multi_gpu"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_adv_{img_idx}_{SPEC}_{NUM}.png"
 OUTPUT_NOISE_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_noise_{img_idx}_{SPEC}_{NUM}.png"
 OUTPUT_REPORT_PATH = RESULTS_DIR / f"{RESULT_PREFIX}_generations_{img_idx}_{SPEC}_{NUM}.txt"
