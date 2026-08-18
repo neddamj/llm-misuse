@@ -10,9 +10,10 @@ import os
 import re
 import subprocess
 import sys
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 SCHEMA_VERSION = 1
@@ -45,11 +46,15 @@ OCR_MODELS = {
         "model_name": "baidu/Qianfan-OCR",
         "model_family": "qianfan",
         "ocr_prompt": "Read all text in the image and output only the extracted text.",
+        "available": False,
+        "unavailable_reason": "The canonical OCR environment does not provide Qianfan OCR's required Transformers model class.",
     },
     "hunyuan_ocr": {
         "model_name": "tencent/HunyuanOCR",
         "model_family": "hunyuan",
         "ocr_prompt": "提取图中的文字。",
+        "available": False,
+        "unavailable_reason": "The canonical OCR environment does not provide HunyuanOCR's required Transformers model class.",
     },
     "donut": {
         "model_name": "naver-clova-ix/donut-base-finetuned-docvqa",
@@ -167,7 +172,11 @@ def _vlm_defaults(workflow: str) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "device": "cuda:0",
         "seed": 0,
-        "prompt": "Please repeat the text shown in the image.",
+        "prompt": (
+            "Solve the problems shown in the image. Show steps and give the final answers."
+            if workflow in {"vlm_attack", "vlm_pipeline"}
+            else "Please repeat the text shown in the image."
+        ),
         "generation": {
             "max_new_tokens": 128,
             "do_sample": False,
@@ -207,6 +216,8 @@ def _vlm_defaults(workflow: str) -> dict[str, Any]:
                 }
             }
         )
+    if workflow == "vlm_pipeline":
+        defaults["transfer_device"] = defaults["device"]
     return defaults
 
 
@@ -229,7 +240,8 @@ def example_manifest(workflow: str) -> dict[str, Any]:
         if workflow == "ocr_inference":
             config["inputs"] = {"image": "results/nougat_ocr_12_adv_15.png"}
         config.update(_ocr_defaults(workflow))
-        config["prompt"] = OCR_MODELS["donut"]["ocr_prompt"]
+        if workflow in {"ocr_attack", "ocr_pipeline"}:
+            config["prompt"] = OCR_MODELS["donut"]["ocr_prompt"]
         return config
 
     config = {
@@ -239,7 +251,7 @@ def example_manifest(workflow: str) -> dict[str, Any]:
         "inputs": {"image": "data/images/6.png"},
         "models": {
             "attack": "llava_1_5_7b_hf",
-            "transfer": ["instructblip_vicuna_7b"],
+            "transfer": ["internvl3_1b_hf"],
         }
         if workflow == "vlm_pipeline"
         else (["internvl3_1b_hf", "openflamingo_4b", "molmo_7b_d_0924"] if workflow == "vlm_inference" else "llava_1_5_7b_hf"),
@@ -272,30 +284,48 @@ def _path_value(value: Any, label: str) -> str:
     return str(path)
 
 
-def _model_keys(config: dict[str, Any]) -> list[str]:
-    raw = config.get("models")
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        keys: list[str] = []
-        for field in ("attack", "transfer", "models", "inference"):
-            value = raw.get(field)
-            if isinstance(value, str):
-                keys.append(value)
-            elif isinstance(value, list):
-                keys.extend(value)
-        return keys
-    return []
+def _as_model_list(value: Any, label: str) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise ValueError(f"{label} must be a model key or a non-empty list of model keys.")
+    if not values or any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValueError(f"{label} must be a model key or a non-empty list of model keys.")
+    return list(values)
 
 
-def _model_table(workflow: str) -> dict[str, dict[str, Any]]:
-    if workflow.startswith("ocr"):
-        return OCR_MODELS
+def _selected_model_keys(workflow: str, models: Any) -> tuple[list[str], list[str]]:
+    """Return attack and sequential-inference selections after checking shape."""
+    if workflow == "ocr_attack":
+        if not isinstance(models, str) or not models.strip():
+            raise ValueError("ocr_attack models must be one OCR model key.")
+        return [models], []
+    if workflow == "ocr_inference":
+        return [], _as_model_list(models, "ocr_inference models")
+    if workflow == "ocr_pipeline":
+        if not isinstance(models, dict) or set(models) - {"attack", "transfer"}:
+            raise ValueError("ocr_pipeline models must contain only attack and transfer fields.")
+        attack = models.get("attack")
+        if not isinstance(attack, str) or not attack.strip():
+            raise ValueError("ocr_pipeline models.attack must be one OCR model key.")
+        return [attack], _as_model_list(models.get("transfer"), "ocr_pipeline models.transfer")
+    if workflow == "vlm_attack":
+        if isinstance(models, dict):
+            raise ValueError("vlm_attack models must be one or more VLM attack model keys, not a pipeline object.")
+        return _as_model_list(models, "vlm_attack models"), []
     if workflow == "vlm_inference":
-        return VLM_INFERENCE_MODELS
-    return VLM_ATTACK_MODELS
+        if isinstance(models, dict):
+            raise ValueError("vlm_inference models must be one or more VLM inference model keys, not a pipeline object.")
+        return [], _as_model_list(models, "vlm_inference models")
+    if workflow == "vlm_pipeline":
+        if not isinstance(models, dict) or set(models) - {"attack", "transfer"}:
+            raise ValueError("vlm_pipeline models must contain only attack and transfer fields.")
+        return _as_model_list(models.get("attack"), "vlm_pipeline models.attack"), _as_model_list(
+            models.get("transfer"), "vlm_pipeline models.transfer"
+        )
+    raise ValueError(f"Unsupported workflow {workflow!r}.")
 
 
 def resolve_manifest(raw: dict[str, Any]) -> dict[str, Any]:
@@ -321,28 +351,82 @@ def resolve_manifest(raw: dict[str, Any]) -> dict[str, Any]:
     if "adversarial" in inputs:
         resolved["inputs"]["adversarial"] = _path_value(inputs["adversarial"], "inputs.adversarial")
 
-    model_table = _model_table(workflow)
-    keys = _model_keys(resolved)
-    if not keys:
-        raise ValueError("models must select at least one model key.")
-    unknown = [key for key in keys if not isinstance(key, str) or key not in model_table]
-    if unknown:
-        unknown_display = ", ".join(sorted(map(str, unknown)))
-        raise ValueError(f"Unknown model key(s): {unknown_display}.")
-    resolved["model_revisions"] = [model_table[key]["model_name"] for key in keys]
+    attack_keys, transfer_keys = _selected_model_keys(workflow, resolved.get("models"))
+    keys = attack_keys + transfer_keys
+    attack_table = OCR_MODELS if workflow.startswith("ocr") else VLM_ATTACK_MODELS
+    transfer_table = OCR_MODELS if workflow.startswith("ocr") else VLM_INFERENCE_MODELS
+    unknown_attack = [key for key in attack_keys if key not in attack_table]
+    unknown_transfer = [key for key in transfer_keys if key not in transfer_table]
+    if unknown_attack or unknown_transfer:
+        parts = []
+        if unknown_attack:
+            parts.append("attack=" + ", ".join(sorted(map(str, unknown_attack))))
+        if unknown_transfer:
+            parts.append("transfer=" + ", ".join(sorted(map(str, unknown_transfer))))
+        raise ValueError("Unknown model key(s): " + "; ".join(parts) + ".")
+    unavailable = [
+        key for key in keys
+        if not (attack_table if key in attack_keys else transfer_table)[key].get("available", True)
+    ]
+    if unavailable:
+        details = "; ".join(
+            f"{key}: {(attack_table if key in attack_keys else transfer_table)[key].get('unavailable_reason', 'not available')}"
+            for key in unavailable
+        )
+        raise ValueError(f"Selected model(s) are unavailable in the canonical environment: {details}")
+    resolved["model_ids"] = {
+        key: (attack_table if key in attack_keys else transfer_table)[key]["model_name"]
+        for key in dict.fromkeys(keys)
+    }
+    # No model revision resolver is implemented; never mislabel model IDs as revisions.
+    requested_revisions = raw.get("revisions", raw.get("model_revisions"))
+    if requested_revisions is None:
+        requested_revisions = {}
+    if not isinstance(requested_revisions, dict):
+        raise ValueError("revisions must be an object mapping selected model keys to revision identifiers.")
+    if any(key not in keys or not isinstance(value, str) or not value.strip() for key, value in requested_revisions.items()):
+        raise ValueError("revisions keys must be selected model keys and values must be non-empty strings.")
+    resolved["revisions"] = dict(requested_revisions)
+    # Keep the compatibility field honest: it contains only explicit revisions,
+    # never model IDs inferred from the catalog.
+    resolved["model_revisions"] = dict(requested_revisions)
 
     if workflow.startswith("ocr"):
-        selected = keys[0]
-        model_defaults = OCR_MODELS[selected]
-        if resolved.get("prompt") is None:
-            resolved["prompt"] = model_defaults.get("ocr_prompt")
-        resolved["ocr_model_defaults"] = {
-            key: value for key, value in model_defaults.items() if key in {"base_size", "image_size", "crop_mode"}
-        }
+        if workflow in {"ocr_attack", "ocr_pipeline"}:
+            model_defaults = OCR_MODELS[attack_keys[0]]
+            if resolved.get("prompt") is None:
+                resolved["prompt"] = model_defaults.get("ocr_prompt")
+            resolved["ocr_model_defaults"] = {
+                key: value for key, value in model_defaults.items() if key in {"base_size", "image_size", "crop_mode"}
+            }
+        if "inference_prompts" in resolved:
+            prompts = resolved["inference_prompts"]
+            if not isinstance(prompts, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str) for key, value in prompts.items()
+            ):
+                raise ValueError("inference_prompts must map model keys to prompt strings.")
+            invalid_prompt_keys = sorted(set(prompts) - set(transfer_keys or attack_keys))
+            if invalid_prompt_keys:
+                raise ValueError("inference_prompts contains model keys not selected for inference: " + ", ".join(invalid_prompt_keys))
     else:
-        resolved["devices"] = _resolve_devices(resolved, keys)
-        if "attack" in resolved and resolved["attack"]["mode"] == "targeted" and not resolved["attack"].get("target_texts"):
+        if workflow == "vlm_inference" and "devices" in resolved:
+            raise ValueError("vlm_inference uses device only; remove devices.")
+        if workflow == "vlm_pipeline":
+            resolved["transfer_device"] = (
+                resolved.get("transfer_device") if "transfer_device" in raw else resolved.get("device", "cuda:0")
+            )
+        if workflow in {"vlm_attack", "vlm_pipeline"}:
+            resolved["devices"] = _resolve_devices(resolved, attack_keys)
+        if (
+            isinstance(resolved.get("attack"), dict)
+            and resolved["attack"].get("mode") == "targeted"
+            and not resolved["attack"].get("target_texts")
+        ):
             raise ValueError("attack.target_texts must be non-empty for a targeted attack.")
+    if workflow.startswith("ocr") and "devices" in raw:
+        raise ValueError("OCR workflows use device only; remove devices.")
+    if workflow != "vlm_pipeline" and "transfer_device" in raw:
+        raise ValueError("transfer_device is supported only by vlm_pipeline.")
     _validate_values(resolved)
     return resolved
 
@@ -350,12 +434,9 @@ def resolve_manifest(raw: dict[str, Any]) -> dict[str, Any]:
 def _resolve_devices(config: dict[str, Any], keys: list[str]) -> list[str]:
     explicit = config.get("devices")
     if explicit is None:
-        base = str(config.get("device", "cuda:0"))
-        try:
-            start = int(base.split(":", 1)[1]) if ":" in base else 0
-        except ValueError as exc:
-            raise ValueError("device must look like cuda:0.") from exc
-        return [f"cuda:{start + index}" for index in range(len(keys))]
+        if len(keys) != 1:
+            raise ValueError("devices must explicitly list one unique CUDA device per selected VLM attack model.")
+        return [str(config.get("device", "cuda:0"))]
     if not isinstance(explicit, list) or len(explicit) != len(keys):
         raise ValueError("devices must be a list with one explicit CUDA device per selected model.")
     return [str(device) for device in explicit]
@@ -366,19 +447,27 @@ def _validate_values(config: dict[str, Any]) -> None:
     if not isinstance(device, str) or not re.fullmatch(r"cuda:\d+", device):
         raise ValueError("device must be an explicit CUDA device such as 'cuda:0'.")
     generation = config.get("generation", {})
-    if not isinstance(generation.get("max_new_tokens"), int) or generation["max_new_tokens"] <= 0:
+    if not isinstance(generation, dict):
+        raise ValueError("generation must be an object.")
+    if not isinstance(generation.get("max_new_tokens"), int) or isinstance(generation["max_new_tokens"], bool) or generation["max_new_tokens"] <= 0:
         raise ValueError("generation.max_new_tokens must be a positive integer.")
     if "seed" not in config or not isinstance(config["seed"], int):
         raise ValueError("seed must be an integer.")
     if "attack" in config:
         attack = config["attack"]
-        if attack.get("epsilon", 0) <= 0 or attack["epsilon"] > 1:
+        if not isinstance(attack, dict):
+            raise ValueError("attack must be an object.")
+        epsilon = attack.get("epsilon")
+        alpha = attack.get("alpha")
+        if not isinstance(epsilon, (int, float)) or isinstance(epsilon, bool) or epsilon <= 0 or epsilon > 1:
             raise ValueError("attack.epsilon must be in (0, 1].")
-        if attack.get("alpha", 0) <= 0 or attack["alpha"] > attack["epsilon"]:
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or alpha <= 0 or alpha > epsilon:
             raise ValueError("attack.alpha must be in (0, attack.epsilon].")
         if not isinstance(attack.get("steps"), int) or attack["steps"] <= 0:
             raise ValueError("attack.steps must be a positive integer.")
     if config["workflow"].startswith("vlm"):
+        if not isinstance(config.get("prompt"), str) or not config["prompt"].strip():
+            raise ValueError("prompt must be a non-empty string for VLM workflows.")
         attack = config.get("attack", {})
         if attack and attack.get("mode") not in {"targeted", "untargeted"}:
             raise ValueError("attack.mode must be 'targeted' or 'untargeted'.")
@@ -392,11 +481,15 @@ def _validate_values(config: dict[str, Any]) -> None:
             target_texts = attack["target_texts"]
             if not isinstance(target_texts, list) or any(not isinstance(value, str) or not value for value in target_texts):
                 raise ValueError("attack.target_texts must be a list of non-empty strings.")
-        if generation.get("temperature", 0) <= 0:
+        temperature = generation.get("temperature")
+        top_p = generation.get("top_p")
+        if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or temperature <= 0:
             raise ValueError("generation.temperature must be positive.")
-        if not 0 < generation.get("top_p", 0) <= 1:
+        if not isinstance(top_p, (int, float)) or isinstance(top_p, bool) or not 0 < top_p <= 1:
             raise ValueError("generation.top_p must be in (0, 1].")
         eot = config.get("eot", {})
+        if not isinstance(eot, dict):
+            raise ValueError("eot must be an object.")
         for field in ("train_samples", "eval_samples"):
             if not isinstance(eot.get(field), int) or eot[field] <= 0:
                 raise ValueError(f"eot.{field} must be a positive integer.")
@@ -409,11 +502,16 @@ def _validate_values(config: dict[str, Any]) -> None:
             value = eot.get(field)
             if not isinstance(value, list) or len(value) != 2 or value[0] <= 0 or value[1] < value[0]:
                 raise ValueError(f"eot.{field} must be a positive [low, high] pair.")
-        devices = config.get("devices", [])
-        if len(set(devices)) != len(devices):
-            raise ValueError("Each VLM worker must use a distinct CUDA device.")
-        if any(not re.fullmatch(r"cuda:\d+", device_name) for device_name in devices):
-            raise ValueError("Every VLM worker device must be explicit, such as 'cuda:0'.")
+        if config["workflow"] in {"vlm_attack", "vlm_pipeline"}:
+            devices = config.get("devices", [])
+            if len(set(devices)) != len(devices):
+                raise ValueError("Each VLM attack worker must use a distinct CUDA device.")
+            if any(not isinstance(device_name, str) or not re.fullmatch(r"cuda:\d+", device_name) for device_name in devices):
+                raise ValueError("Every VLM attack worker device must be explicit, such as 'cuda:0'.")
+        if config["workflow"] == "vlm_pipeline":
+            transfer_device = config.get("transfer_device")
+            if not isinstance(transfer_device, str) or not re.fullmatch(r"cuda:\d+", transfer_device):
+                raise ValueError("transfer_device must be an explicit CUDA device such as 'cuda:0'.")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -470,12 +568,17 @@ def runtime_metadata(config: dict[str, Any]) -> dict[str, Any]:
     cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "all visible devices")
     return {
         "git_commit": _git_commit(),
+        **_git_worktree_metadata(),
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
         "sys_executable": sys.executable,
         "conda_environment": conda_env,
         "python_version": sys.version.split()[0],
         "library_versions": package_versions(),
         "cuda_devices": cuda_devices,
-        "requested_model_revisions": config.get("model_revisions", []),
+        "model_ids": config.get("model_ids", {}),
+        "requested_revisions": config.get("revisions", {}),
+        "requested_model_revisions": config.get("model_revisions", {}),
     }
 
 
@@ -492,6 +595,40 @@ def _git_commit() -> str | None:
         return None
 
 
+def _git_worktree_metadata() -> dict[str, Any]:
+    """Capture enough local state to distinguish dirty runs from HEAD-only runs."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD", "--", "src", "AGENTS.md", "plans"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_dirty": None, "git_diff_hash": None, "git_changed_files": []}
+    changed_files = []
+    for line in status.splitlines():
+        if len(line) >= 4:
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            changed_files.append(path)
+    payload = status + "\n" + diff + "\n" + "\n".join(sorted(changed_files))
+    return {
+        "git_dirty": bool(status.strip()),
+        "git_diff_hash": hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest(),
+        "git_changed_files": sorted(set(changed_files)),
+    }
+
+
 class EventLog:
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
@@ -505,8 +642,6 @@ class EventLog:
         line = f"[{record['timestamp']}] {event}"
         if payload:
             line += " " + canonical_json(payload)
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
         print(line, flush=True)
 
 
@@ -544,13 +679,32 @@ def deterministic_summary(config: dict[str, Any], results: dict[str, Any], statu
     metrics = results.get("metrics", {})
     if metrics:
         lines.extend(["## Metrics", ""])
-        for key in sorted(metrics):
-            value = metrics[key]
-            lines.append(f"- `{key}`: {json.dumps(value, sort_keys=True, ensure_ascii=False)}")
+        scalar_metrics = _flatten_scalar_metrics(metrics)
+        for key in sorted(scalar_metrics):
+            lines.append(f"- `{key}`: {json.dumps(scalar_metrics[key], sort_keys=True, ensure_ascii=False)}")
+        complex_metrics = sorted(set(metrics) - {key.split(".", 1)[0] for key in scalar_metrics})
+        if complex_metrics:
+            lines.append("")
+            lines.append("Nested/non-scalar metric objects are preserved in `results.json`.")
         lines.append("")
     if results.get("raw_outputs"):
         lines.extend(["## Outputs", "", "Raw generations/transcriptions are preserved in `results.json`.", ""])
     return "\n".join(lines)
+
+
+def _flatten_scalar_metrics(value: Any, prefix: str = "") -> dict[str, int | float | bool]:
+    """Flatten only numeric and boolean leaves for conservative comparisons."""
+    if isinstance(value, bool):
+        return {prefix: value} if prefix else {}
+    if isinstance(value, (int, float)) and not isinstance(value, complex):
+        return {prefix: value} if prefix else {}
+    if isinstance(value, dict):
+        flattened: dict[str, int | float | bool] = {}
+        for key in sorted(value):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_scalar_metrics(value[key], child_prefix))
+        return flattened
+    return {}
 
 
 def expected_interpreter(workflow: str) -> str:
@@ -577,8 +731,15 @@ def check_cuda_devices(config: dict[str, Any]) -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("This workflow requires CUDA, but CUDA is not available in the selected environment.")
-    requested = [config.get("device", "cuda:0")]
-    requested.extend(config.get("devices", []))
+    workflow = config.get("workflow")
+    if workflow == "vlm_attack":
+        # With an explicit worker list, the top-level device is not used.
+        requested = list(config.get("devices", [config.get("device", "cuda:0")]))
+    elif workflow == "vlm_pipeline":
+        requested = list(config.get("devices", [config.get("device", "cuda:0")]))
+        requested.append(config.get("transfer_device", config.get("device", "cuda:0")))
+    else:
+        requested = [config.get("device", "cuda:0")]
     count = torch.cuda.device_count()
     for device_name in requested:
         index = int(device_name.split(":", 1)[1])

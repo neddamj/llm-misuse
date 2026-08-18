@@ -1,4 +1,5 @@
 import queue
+import sys
 import traceback
 import time
 from typing import TypedDict
@@ -22,7 +23,35 @@ from attacks.prompting import (
 from attacks.vision import build_vision_inputs, resolve_model_family
 
 
-def ensure_remote_processor_compat(model_name: str) -> None:
+class _WorkerTee:
+    """Mirror spawned-worker output into the parent run's terminal log."""
+
+    def __init__(self, stream, log_handle):
+        self.stream = stream
+        self.log_handle = log_handle
+
+    def write(self, value: str) -> int:
+        self.stream.write(value)
+        self.log_handle.write(value)
+        self.log_handle.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log_handle.flush()
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+    @property
+    def encoding(self):
+        return getattr(self.stream, "encoding", "utf-8")
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def ensure_remote_processor_compat(model_name: str, revision: str | None = None) -> None:
     # Keep remote processor/model code working across transformer/numpy version mismatches.
     import importlib
     import numpy as np
@@ -68,7 +97,12 @@ def ensure_remote_processor_compat(model_name: str) -> None:
         rope_utils.ROPE_INIT_FUNCTIONS["default"] = default_rope_init_fn
 
     if model_name == "jinaai/jina-vlm":
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        revision_kwargs = {"revision": revision} if revision else {}
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            **revision_kwargs,
+        )
         module_base = config.__class__.__module__.rsplit(".", 1)[0]
         blocks_module = importlib.import_module(f"{module_base}.blocks_jvlm")
         rotary_embedding_cls = blocks_module.RotaryEmbedding
@@ -101,13 +135,16 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
 
     print(f"[Worker:{model_spec['key']}] Loading model {model_spec['model_name']} on {device_name}")
     trust_remote_code = bool(model_spec.get("trust_remote_code", False))
+    revision = model_spec.get("revision")
+    revision_kwargs = {"revision": revision} if revision else {}
     if trust_remote_code:
-        ensure_remote_processor_compat(model_spec["model_name"])
+        ensure_remote_processor_compat(model_spec["model_name"], revision)
     try:
         processor = AutoProcessor.from_pretrained(
             model_spec["model_name"],
             use_fast=False,
             trust_remote_code=trust_remote_code,
+            **revision_kwargs,
         )
     except ValueError as exc:
         if "does not have a slow version" not in str(exc):
@@ -116,6 +153,7 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             model_spec["model_name"],
             use_fast=True,
             trust_remote_code=trust_remote_code,
+            **revision_kwargs,
         )
 
     if (
@@ -126,6 +164,7 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             processor = InstructBlipProcessor.from_pretrained(
                 model_spec["model_name"],
                 trust_remote_code=trust_remote_code,
+                **revision_kwargs,
             )
         except ValueError as exc:
             if "does not have a slow version" not in str(exc):
@@ -134,6 +173,7 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
                 model_spec["model_name"],
                 use_fast=True,
                 trust_remote_code=trust_remote_code,
+                **revision_kwargs,
             )
 
     auto_model_class = model_spec.get("auto_model_class", "image_text_to_text")
@@ -142,12 +182,14 @@ def load_worker_state(model_spec: dict, worker_config: dict) -> dict:
             model_spec["model_name"],
             dtype=dtype,
             trust_remote_code=trust_remote_code,
+            **revision_kwargs,
         ).to(device)
     else:
         model = AutoModelForImageTextToText.from_pretrained(
             model_spec["model_name"],
             dtype=dtype,
             trust_remote_code=trust_remote_code,
+            **revision_kwargs,
         ).to(device)
     model.eval()
     model.requires_grad_(False)
@@ -545,6 +587,24 @@ def attack_step(state: dict, image_cpu: torch.Tensor) -> dict:
 
 
 def worker_main(model_spec: dict, worker_config: dict, request_queue, response_queue) -> None:
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_handle = None
+    run_log_path = worker_config.get("run_log_path")
+    if isinstance(run_log_path, str) and run_log_path:
+        try:
+            log_handle = open(run_log_path, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            response_queue.put(
+                {
+                    "type": "error",
+                    "key": model_spec["key"],
+                    "message": traceback.format_exc(),
+                }
+            )
+            return
+        sys.stdout = _WorkerTee(original_stdout, log_handle)
+        sys.stderr = _WorkerTee(original_stderr, log_handle)
     try:
         state = load_worker_state(model_spec, worker_config)
         response_queue.put(
@@ -608,6 +668,11 @@ def worker_main(model_spec: dict, worker_config: dict, request_queue, response_q
                 "message": traceback.format_exc(),
             }
         )
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if log_handle is not None:
+            log_handle.close()
 
 
 def receive_message(worker: dict) -> dict:

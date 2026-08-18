@@ -1,6 +1,8 @@
+import gc
 import importlib.util
 import math
 import os
+import traceback
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -1381,14 +1383,45 @@ def _ocr_model_keys(config: dict) -> tuple[str, list[str]]:
     raise ValueError("OCR models must be a model key, list, or pipeline object.")
 
 
-def _ocr_config_for_model(config: dict, model_key: str) -> dict:
+def _resolve_ocr_prompt(
+    config: dict,
+    model_key: str,
+    *,
+    inference: bool = False,
+    allow_global_prompt: bool = False,
+) -> str | None:
+    model_definition = MODEL_CONFIGS[model_key]
+    if inference:
+        inference_prompts = config.get("inference_prompts")
+        if isinstance(inference_prompts, dict):
+            if model_key in inference_prompts:
+                return inference_prompts[model_key]
+            model_name = model_definition["model_name"]
+            if model_name in inference_prompts:
+                return inference_prompts[model_name]
+        if allow_global_prompt and config.get("prompt") is not None:
+            return config.get("prompt")
+        return model_definition.get("ocr_prompt")
+    return config.get("prompt") if config.get("prompt") is not None else model_definition.get("ocr_prompt")
+
+
+def _ocr_config_for_model(
+    config: dict,
+    model_key: str,
+    *,
+    inference: bool = False,
+    allow_global_prompt: bool = False,
+) -> dict:
     model_definition = MODEL_CONFIGS[model_key]
     model_config = dict(config)
     model_config["model_key"] = model_key
     model_config["model_name"] = model_definition["model_name"]
     model_config["model_family"] = model_definition["model_family"]
-    model_config["ocr_prompt"] = (
-        config.get("prompt") if config.get("prompt") is not None else model_definition.get("ocr_prompt")
+    model_config["ocr_prompt"] = _resolve_ocr_prompt(
+        config,
+        model_key,
+        inference=inference,
+        allow_global_prompt=allow_global_prompt,
     )
     for key in ("base_size", "image_size", "crop_mode"):
         if key in model_definition:
@@ -1397,11 +1430,40 @@ def _ocr_config_for_model(config: dict, model_key: str) -> dict:
     return model_config
 
 
+def _pretrained_kwargs(config: dict, **kwargs: Any) -> dict[str, Any]:
+    """Add a configured model revision to every loader call, when supplied."""
+    result = dict(kwargs)
+    revisions = config.get("revisions")
+    revision = None
+    if isinstance(revisions, dict):
+        revision = revisions.get(config.get("model_key"))
+        if revision is None:
+            revision = revisions.get(config.get("model_name"))
+    if revision is None:
+        revision = config.get("revision")
+    if revision is not None:
+        result["revision"] = revision
+    return result
+
+
+def _release_ocr_memory() -> None:
+    """Release Python references before asking CUDA to reclaim cached blocks."""
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) -> dict:
     device = torch.device(config.get("device", "cuda:0"))
     torch.cuda.set_device(device)
     model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    source_image_path = Path(config["inputs"]["image"])
+    input_paths = config["inputs"]
+    source_image_value = input_paths.get("clean", input_paths.get("image"))
+    if source_image_value is None:
+        raise ValueError("OCR runtime requires inputs.image or inputs.clean.")
+    source_image_path = Path(source_image_value)
     model_family = config["model_family"]
     model_name = config["model_name"]
     prompt = config.get("ocr_prompt")
@@ -1411,14 +1473,20 @@ def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) 
     tokenizer = None
     processor = None
     prompt_model_inputs = {}
+    prompt_token_count = 0
     if model_family == "deepseek":
         ensure_deepseek_transformers_compat()
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, **_pretrained_kwargs(config, trust_remote_code=True)
+        )
         model = AutoModel.from_pretrained(
             model_name,
-            trust_remote_code=True,
-            use_safetensors=True,
-            torch_dtype=model_dtype,
+            **_pretrained_kwargs(
+                config,
+                trust_remote_code=True,
+                use_safetensors=True,
+                torch_dtype=model_dtype,
+            ),
         ).to(device)
         state = {
             "device": device,
@@ -1444,8 +1512,10 @@ def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) 
         patch_deepseek_forward(model)
     elif model_family == "qianfan":
         ensure_qianfan_transformers_support()
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = AutoModelForImageTextToText.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
+        processor = AutoProcessor.from_pretrained(model_name, **_pretrained_kwargs(config))
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name, **_pretrained_kwargs(config, torch_dtype=model_dtype)
+        ).to(device)
         image_processor = processor.image_processor
         state = {
             "device": device,
@@ -1458,9 +1528,9 @@ def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) 
         prompt_dummy_image_size = (int(x_clean.shape[-1]), int(x_clean.shape[-2]))
     elif model_family == "hunyuan":
         ensure_hunyuan_transformers_support()
-        processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        processor = AutoProcessor.from_pretrained(model_name, **_pretrained_kwargs(config, use_fast=False))
         model = getattr(transformers, "HunYuanVLForConditionalGeneration").from_pretrained(
-            model_name, attn_implementation="eager", dtype=model_dtype
+            model_name, **_pretrained_kwargs(config, attn_implementation="eager", dtype=model_dtype)
         ).to(device)
         image_processor = processor.image_processor
         vision_config = model.config.vision_config
@@ -1481,10 +1551,16 @@ def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) 
     elif is_encoder_decoder_family(model_family):
         if model_family == "encoder_decoder_nougat":
             ensure_nougat_dependencies()
-            processor = NougatProcessor.from_pretrained(model_name, backend="torchvision")
+            processor = NougatProcessor.from_pretrained(
+                model_name, **_pretrained_kwargs(config, backend="torchvision")
+            )
         else:
-            processor = DonutProcessor.from_pretrained(model_name, backend="torchvision", use_fast=False)
-        model = VisionEncoderDecoderModel.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
+            processor = DonutProcessor.from_pretrained(
+                model_name, **_pretrained_kwargs(config, backend="torchvision", use_fast=False)
+            )
+        model = VisionEncoderDecoderModel.from_pretrained(
+            model_name, **_pretrained_kwargs(config, torch_dtype=model_dtype)
+        ).to(device)
         prompt_model_inputs = build_encoder_decoder_prompt_inputs(processor.tokenizer, prompt, device)
         state = {
             "device": device,
@@ -1494,9 +1570,11 @@ def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) 
             **prompt_model_inputs,
         }
     else:
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_name, **_pretrained_kwargs(config, trust_remote_code=True)
+        )
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name, trust_remote_code=True, torch_dtype=model_dtype
+            model_name, **_pretrained_kwargs(config, trust_remote_code=True, torch_dtype=model_dtype)
         ).to(device)
         vision_config = model.config.vision_config
         state = {
@@ -1562,14 +1640,38 @@ def _generate_ocr_text(runtime: dict, image_tensor: torch.Tensor, max_new_tokens
 
 
 def _run_one_ocr_inference(config: dict, model_key: str, image_paths: dict[str, Path], event_callback=None) -> dict:
-    model_config = _ocr_config_for_model(config, model_key)
+    model_config = _ocr_config_for_model(
+        config,
+        model_key,
+        inference=True,
+        allow_global_prompt=bool(config.get("_allow_global_inference_prompt", False)),
+    )
     device = torch.device(model_config.get("device", "cuda:0"))
-    tensors = {key: load_image_tensor(path, device) for key, path in image_paths.items()}
-    runtime = _load_ocr_runtime(model_config, tensors["image"], event_callback)
-    outputs = {key: _generate_ocr_text(runtime, tensor, int(config["generation"]["max_new_tokens"])) for key, tensor in tensors.items()}
-    if event_callback is not None:
-        event_callback("model_completed", model_key=model_key, output_lengths={key: len(value) for key, value in outputs.items()})
-    return outputs
+    tensors = {}
+    runtime = None
+    try:
+        tensors = {key: load_image_tensor(path, device) for key, path in image_paths.items()}
+        base_key = "clean" if "clean" in tensors else "image"
+        runtime = _load_ocr_runtime(model_config, tensors[base_key], event_callback)
+        outputs = {
+            key: _generate_ocr_text(runtime, tensor, int(config["generation"]["max_new_tokens"]))
+            for key, tensor in tensors.items()
+        }
+        if event_callback is not None:
+            event_callback(
+                "model_completed",
+                model_key=model_key,
+                output_lengths={key: len(value) for key, value in outputs.items()},
+            )
+        return outputs
+    finally:
+        # Explicitly drop model, processor, and GPU tensor references before the
+        # next transfer model is loaded.  empty_cache is harmless on CPU-only
+        # monkeypatched test runs as well as on CUDA.
+        if runtime is not None:
+            runtime.clear()
+        tensors.clear()
+        _release_ocr_memory()
 
 
 def _selected_ocr_inference_keys(config: dict) -> list[str]:
@@ -1581,20 +1683,48 @@ def _selected_ocr_inference_keys(config: dict) -> list[str]:
 
 
 def run_ocr_inference(config: dict, event_callback=None) -> dict:
-    image_paths = {"image": Path(config["inputs"]["image"])}
-    for field in ("clean", "adversarial"):
-        if field in config["inputs"]:
-            image_paths[field] = Path(config["inputs"][field])
+    inputs = config["inputs"]
+    if "clean" in inputs and "adversarial" in inputs:
+        image_paths = {
+            "clean": Path(inputs["clean"]),
+            "adversarial": Path(inputs["adversarial"]),
+        }
+    else:
+        image_paths = {"image": Path(inputs["image"])}
     outputs = {}
     errors = []
-    for model_key in _selected_ocr_inference_keys(config):
+    selected_keys = _selected_ocr_inference_keys(config)
+    inference_config = dict(config)
+    # A global prompt is only unambiguous for a direct, single-model inference
+    # manifest.  Pipeline transfer always uses each model's native OCR prompt.
+    inference_config["_allow_global_inference_prompt"] = (
+        len(selected_keys) == 1
+        and set(image_paths) == {"image"}
+        and not isinstance(config.get("models"), dict)
+        and not bool(config.get("_pipeline_transfer", False))
+    )
+    for model_key in selected_keys:
         try:
-            outputs[model_key] = _run_one_ocr_inference(config, model_key, image_paths, event_callback)
+            outputs[model_key] = _run_one_ocr_inference(
+                inference_config, model_key, image_paths, event_callback
+            )
         except Exception as exc:
-            errors.append({"model_key": model_key, "type": type(exc).__name__, "message": str(exc)})
+            error_record = {
+                "model_key": model_key,
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            errors.append(error_record)
             if event_callback is not None:
-                event_callback("error", stage="inference", model_key=model_key, message=str(exc))
-    metrics = {"models_requested": len(_selected_ocr_inference_keys(config)), "models_succeeded": len(outputs)}
+                event_callback(
+                    "error",
+                    stage="inference",
+                    model_key=model_key,
+                    message=str(exc),
+                    traceback=error_record["traceback"],
+                )
+    metrics = {"models_requested": len(selected_keys), "models_succeeded": len(outputs)}
     if "clean" in image_paths and "adversarial" in image_paths:
         metrics["textual_change_metrics_are_behavioral"] = True
         metrics["per_model_transcription_changes"] = {}
@@ -1643,7 +1773,13 @@ def run_ocr_attack(config: dict, event_callback=None) -> dict:
     adv_text = _generate_ocr_text(runtime, x_adv, int(config["generation"]["max_new_tokens"]))
     if event_callback is not None:
         event_callback("model_completed", model_key=attack_key, output_lengths={"clean": len(clean_text), "adversarial": len(adv_text)})
+    configured_epsilon = float(attack["epsilon"])
     linf_delta = float(delta.abs().max().item())
+    if linf_delta > configured_epsilon + 1e-6:
+        raise RuntimeError(
+            "Perturbation exceeds the configured L_inf bound: "
+            f"{linf_delta:.6f} > {configured_epsilon:.6f}"
+        )
     artifact_dir = Path(config["_artifact_dir"])
     artifact_dir.mkdir(parents=True, exist_ok=True)
     adv_path = artifact_dir / "adversarial.png"
@@ -1662,6 +1798,11 @@ def run_ocr_attack(config: dict, event_callback=None) -> dict:
         "perturbation_norm": linf_delta,
         "textual_change_metrics_are_behavioral": True,
     }
+    # The attack runtime is no longer needed once both transcripts and
+    # artifacts have been produced.  Drop it before a pipeline loads transfer
+    # models, which may otherwise contend with the attack model for VRAM.
+    runtime.clear()
+    _release_ocr_memory()
     return {
         "metrics": metrics,
         "raw_outputs": {"clean": clean_text, "adversarial": adv_text},
@@ -1672,18 +1813,32 @@ def run_ocr_attack(config: dict, event_callback=None) -> dict:
 
 def run_ocr_pipeline(config: dict, event_callback=None) -> dict:
     attack_result = run_ocr_attack(config, event_callback)
+    # Keep this boundary explicit: attack_ocr may have held transient tensor
+    # references until its frame was returned, so collect before transfer load.
+    _release_ocr_memory()
     transfer_keys = _selected_ocr_inference_keys(config)
     clean_path = Path(config["inputs"]["image"])
     adv_path = Path(attack_result["artifacts"]["adversarial_image"])
     transfer_config = dict(config)
-    transfer_config["inputs"] = {"image": str(clean_path), "clean": str(clean_path), "adversarial": str(adv_path)}
+    transfer_config["inputs"] = {"clean": str(clean_path), "adversarial": str(adv_path)}
     transfer_config["models"] = transfer_keys
+    transfer_config["_pipeline_transfer"] = True
     transfer = run_ocr_inference(transfer_config, event_callback)
+    transfer_metrics = transfer["metrics"]
+    attack_errors = attack_result.get("errors") or []
+    transfer_errors = transfer.get("errors") or []
     return {
-        "metrics": {**attack_result["metrics"], "transfer_models_succeeded": transfer["metrics"]["models_succeeded"]},
+        "metrics": {
+            **attack_result["metrics"],
+            "attack": attack_result["metrics"],
+            "transfer": transfer_metrics,
+            # Retain the old flat count for consumers that used it, while the
+            # nested transfer object preserves the complete per-model results.
+            "transfer_models_succeeded": transfer_metrics["models_succeeded"],
+        },
         "raw_outputs": {"attack": attack_result["raw_outputs"], "transfer": transfer["raw_outputs"]},
-        "artifacts": attack_result["artifacts"],
-        "errors": transfer["errors"],
+        "artifacts": {**(attack_result.get("artifacts") or {}), **(transfer.get("artifacts") or {})},
+        "errors": [*attack_errors, *transfer_errors],
     }
 
 

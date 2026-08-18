@@ -1,3 +1,8 @@
+import gc
+import json
+import sys
+import traceback
+import types
 from pathlib import Path
 
 import torch
@@ -800,12 +805,21 @@ VLM_INFERENCE_MODEL_DEFINITIONS = {
     "idefics2": {"model_name": "HuggingFaceM4/idefics2-8b", "family": "idefics2"},
     "smolvlm": {"model_name": "HuggingFaceTB/SmolVLM-Instruct", "family": "smolvlm"},
     "internvl3_1b_hf": {"model_name": "OpenGVLab/InternVL3-1B-hf", "family": "internvl"},
-    "openflamingo_4b": {"model_name": "openflamingo/OpenFlamingo-4B-vitl-rpj3b", "family": "openflamingo"},
+    "openflamingo_4b": {
+        "model_name": "openflamingo/OpenFlamingo-4B-vitl-rpj3b",
+        "family": "openflamingo",
+        "clip_vision_encoder_path": "ViT-L-14",
+        "clip_vision_encoder_pretrained": "openai",
+        "lang_encoder_path": "togethercomputer/RedPajama-INCITE-Base-3B-v1",
+        "tokenizer_path": "togethercomputer/RedPajama-INCITE-Base-3B-v1",
+        "cross_attn_every_n_layers": 2,
+        "checkpoint_filename": "checkpoint.pt",
+    },
     "molmo_7b_d_0924": {"model_name": "allenai/Molmo-7B-D-0924", "family": "molmo"},
 }
 
 
-def _vlm_model_keys(config: dict) -> tuple[str, list[str]]:
+def _vlm_model_keys(config: dict) -> tuple[str | list[str], list[str]]:
     selected = config.get("models")
     if isinstance(selected, str):
         return selected, [selected]
@@ -816,14 +830,33 @@ def _vlm_model_keys(config: dict) -> tuple[str, list[str]]:
     if isinstance(selected, dict):
         attack_key = selected.get("attack")
         transfer = selected.get("transfer", [])
-        if not isinstance(attack_key, str):
-            raise ValueError("VLM pipeline models.attack must be a model key.")
+        if isinstance(attack_key, str):
+            attack_keys: str | list[str] = attack_key
+            attack_list = [attack_key]
+        elif isinstance(attack_key, list) and attack_key and all(isinstance(key, str) for key in attack_key):
+            attack_keys = list(attack_key)
+            attack_list = list(attack_key)
+        else:
+            raise ValueError("VLM pipeline models.attack must be a model key or non-empty list.")
         if isinstance(transfer, str):
             transfer = [transfer]
-        if not isinstance(transfer, list):
+        if not isinstance(transfer, list) or not all(isinstance(key, str) for key in transfer):
             raise ValueError("VLM pipeline models.transfer must be a list.")
-        return attack_key, [attack_key, *transfer]
+        return attack_keys, [*attack_list, *transfer]
     raise ValueError("VLM models must be a model key, list, or pipeline object.")
+
+
+def _pipeline_attack_keys(config: dict) -> list[str]:
+    selected = config.get("models")
+    if not isinstance(selected, dict):
+        _, keys = _vlm_model_keys(config)
+        return list(keys)
+    attack = selected.get("attack")
+    if isinstance(attack, str):
+        return [attack]
+    if isinstance(attack, list) and attack and all(isinstance(key, str) for key in attack):
+        return list(attack)
+    raise ValueError("VLM pipeline models.attack must be a model key or non-empty list.")
 
 
 def _attack_model_specs() -> dict[str, dict]:
@@ -853,14 +886,27 @@ def _configure_vlm_globals(config: dict, keys: list[str]) -> dict[str, object]:
     unknown = [key for key in keys if key not in spec_map]
     if unknown:
         raise ValueError(f"VLM attack model key(s) are not supported by the attack workers: {', '.join(unknown)}")
-    devices = config.get("devices", [config.get("device", "cuda:0")])
+    devices = config.get("devices")
+    if devices is None:
+        devices = [config.get("device", "cuda:0")]
+    if not isinstance(devices, list) or len(devices) < len(keys):
+        raise ValueError("VLM attack devices must include one device per attack model.")
     model_specs = []
+    revisions = config.get("revisions", {})
     for index, key in enumerate(keys):
         spec = dict(spec_map[key])
         spec["device"] = devices[index]
+        if isinstance(revisions, dict) and isinstance(revisions.get(key), str):
+            spec["revision"] = revisions[key]
         model_specs.append(spec)
     attack = config["attack"]
     eot = config["eot"]
+    configured_epsilon = float(attack["epsilon"])
+    configured_alpha = float(attack["alpha"])
+    if not 0 < configured_epsilon <= 1:
+        raise ValueError("attack.epsilon must be in (0, 1].")
+    if not 0 < configured_alpha <= configured_epsilon:
+        raise ValueError("attack.alpha must be in (0, attack.epsilon].")
     MODEL_SPECS = model_specs
     USER_PROMPT = config["prompt"]
     ATTACK_MODE = attack["mode"]
@@ -902,6 +948,13 @@ def _summarize_vlm_metrics(clean_results: dict[str, dict], adv_results: dict[str
             "clean": {key: not bool(value.get("generation")) for key, value in clean_results.items()},
             "adversarial": {key: not bool(value.get("generation")) for key, value in adv_results.items()},
         },
+        "per_model_output_changes": {
+            key: _text_metrics(
+                clean_results[key].get("generation", ""),
+                adv_results[key].get("generation", ""),
+            )
+            for key in clean_results.keys() & adv_results.keys()
+        },
         "textual_change_metrics_are_behavioral": True,
     }
     changes = metrics["loss_changes"]
@@ -915,13 +968,45 @@ def _normalized_text(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def _character_edit_distance(left: str, right: str) -> int:
+    """Return the deterministic Levenshtein distance without external packages."""
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_char != right_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _text_metrics(clean: str, adversarial: str) -> dict[str, object]:
+    distance = _character_edit_distance(clean, adversarial)
+    denominator = max(len(clean), len(adversarial), 1)
+    return {
+        "exact_match": clean == adversarial,
+        "character_edit_distance": distance,
+        "character_edit_rate": distance / denominator,
+        "clean_length": len(clean),
+        "adversarial_length": len(adversarial),
+        "clean_empty": not bool(clean),
+        "adversarial_empty": not bool(adversarial),
+    }
+
+
 def run_vlm_attack(config: dict, event_callback=None) -> dict:
-    attack_key, keys = _vlm_model_keys(config)
-    if isinstance(config.get("models"), dict):
-        keys = [attack_key]
-    previous = _configure_vlm_globals(config, keys)
+    keys = _pipeline_attack_keys(config)
+    previous = None
     workers: list[dict] = []
     try:
+        previous = _configure_vlm_globals(config, keys)
         device = torch.device(config.get("device", "cuda:0"))
         torch.manual_seed(int(config.get("seed", 0)))
         x_clean = load_image_tensor(Path(config["inputs"]["image"]), torch.device("cpu"), ATTACK_IMAGE_SIZE)
@@ -936,6 +1021,9 @@ def run_vlm_attack(config: dict, event_callback=None) -> dict:
             "clip_mean": CLIP_MEAN,
             "clip_std": CLIP_STD,
         }
+        run_dir = config.get("_run_dir")
+        if run_dir:
+            worker_config["run_log_path"] = str(Path(run_dir) / "run.log")
         ctx = mp.get_context("spawn")
         workers = start_workers(ctx, MODEL_SPECS, worker_config)
         if event_callback is not None:
@@ -953,6 +1041,12 @@ def run_vlm_attack(config: dict, event_callback=None) -> dict:
         if event_callback is not None:
             event_callback("stage_started", stage="optimization")
         x_final, delta = run_attack(workers, x_clean, event_callback)
+        perturbation_inf = float(delta.abs().max().item())
+        if perturbation_inf > EPSILON + 1e-6:
+            raise RuntimeError(
+                f"The final perturbation infinity norm {perturbation_inf:.9f} exceeds "
+                f"configured epsilon {EPSILON:.9f}."
+            )
         adv_results = evaluate_workers(workers, x_final)
         adv_eot_summary = evaluate_workers_eot(workers, x_final, num_samples=EOT_EVAL_SAMPLES) if USE_EOT else None
         artifact_dir = Path(config["_artifact_dir"])
@@ -966,7 +1060,7 @@ def run_vlm_attack(config: dict, event_callback=None) -> dict:
             {
                 "attack_mode": ATTACK_MODE,
                 "epsilon": EPSILON,
-                "perturbation_inf": float(delta.abs().max().item()),
+                "perturbation_inf": perturbation_inf,
                 "eot_enabled": USE_EOT,
             }
         )
@@ -994,94 +1088,517 @@ def run_vlm_attack(config: dict, event_callback=None) -> dict:
         }
     finally:
         shutdown_workers(workers)
-        _restore_vlm_globals(previous)
+        if previous is not None:
+            _restore_vlm_globals(previous)
 
 
-def _generic_vlm_output(model, processor, image, prompt: str, device: torch.device, max_new_tokens: int, family: str) -> str:
-    if family == "molmo" and hasattr(processor, "process") and hasattr(model, "generate_from_batch"):
-        processed = processor.process(images=[image], text=prompt)
-        inputs = {
-            key: value.unsqueeze(0).to(device) if torch.is_tensor(value) and value.ndim == 1 else value.to(device) if torch.is_tensor(value) else value
-            for key, value in processed.items()
-        }
-        generated = model.generate_from_batch(inputs, GenerationConfig(max_new_tokens=max_new_tokens, stop_strings="<|endoftext|>"), tokenizer=processor.tokenizer)
-        return processor.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
-    rendered_prompt = prompt
-    if hasattr(processor, "apply_chat_template"):
+def _inference_dtype(device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _revision_kwargs(revision: str | None) -> dict[str, str]:
+    return {"revision": revision} if revision else {}
+
+
+def _requested_revision(config: dict, key: str, model_name: str) -> str | None:
+    revisions = config.get("revisions")
+    if not isinstance(revisions, dict):
+        return None
+    revision = revisions.get(key, revisions.get(model_name))
+    return revision if isinstance(revision, str) and revision else None
+
+
+def _model_device(model, fallback: torch.device) -> torch.device:
+    model_device = getattr(model, "device", None)
+    if model_device is not None and str(model_device) != "meta":
+        return torch.device(model_device)
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        return fallback
+
+
+def _move_inputs_to_model(batch: dict, model, dtype: torch.dtype) -> dict:
+    device = _model_device(model, torch.device("cpu"))
+    moved = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device=device, dtype=dtype) if torch.is_floating_point(value) else value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _generation_kwargs(generation: dict) -> dict[str, object]:
+    kwargs = {
+        "max_new_tokens": int(generation["max_new_tokens"]),
+        "do_sample": bool(generation.get("do_sample", False)),
+    }
+    if kwargs["do_sample"]:
+        kwargs["temperature"] = float(generation["temperature"])
+        kwargs["top_p"] = float(generation["top_p"])
+    return kwargs
+
+
+def ensure_torch_serialization_compat() -> None:
+    if "torch.utils.serialization" in sys.modules:
+        return
+    serialization_module = types.ModuleType("torch.utils.serialization")
+
+    class SourceChangeWarning(Warning):
+        pass
+
+    serialization_module.SourceChangeWarning = SourceChangeWarning
+    sys.modules["torch.utils.serialization"] = serialization_module
+    torch.utils.serialization = serialization_module
+
+
+def _resize_openflamingo_embeddings_for_checkpoint(model, state_dict: dict[str, torch.Tensor]) -> None:
+    embed_key = "lang_encoder.gpt_neox.embed_in.weight"
+    if embed_key not in state_dict:
+        return
+    checkpoint_vocab_size = state_dict[embed_key].shape[0]
+    current_vocab_size = model.lang_encoder.get_input_embeddings().weight.shape[0]
+    if checkpoint_vocab_size != current_vocab_size:
+        model.lang_encoder.resize_token_embeddings(checkpoint_vocab_size)
+
+
+def predownload_molmo_snapshot(model_name: str, revision: str | None = None) -> str:
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    revision_kwargs = _revision_kwargs(revision)
+    snapshot_path = Path(
+        snapshot_download(
+            repo_id=model_name,
+            allow_patterns=["*.json", "*.py", "*.txt"],
+            max_workers=1,
+            **revision_kwargs,
+        )
+    )
+    index_path = snapshot_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        index_path = Path(hf_hub_download(repo_id=model_name, filename="model.safetensors.index.json", **revision_kwargs))
+    with index_path.open("r") as handle:
+        weight_index = json.load(handle)
+    for shard_filename in sorted(set(weight_index["weight_map"].values())):
+        hf_hub_download(repo_id=model_name, filename=shard_filename, **revision_kwargs)
+    return str(index_path.parent)
+
+
+def get_molmo_model_class(model_path: str):
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.generation.utils import GenerationMixin
+
+    molmo_model_class = get_class_from_dynamic_module(
+        "modeling_molmo.MolmoForCausalLM", model_path, local_files_only=True
+    )
+    if getattr(molmo_model_class, "_transformers_5_compat_patched", False):
+        return molmo_model_class
+    original_init = molmo_model_class.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "all_tied_weights_keys"):
+            self.all_tied_weights_keys = {}
+
+    def patched_tie_weights(self, *args, **kwargs):
+        return None
+
+    @classmethod
+    def patched_supports_default_dynamic_cache(cls):
+        return False
+
+    def patched_generate_from_batch(self, batch, generation_config=None, **kwargs):
+        if generation_config is not None:
+            assert generation_config.use_cache
+        input_ids = batch["input_ids"]
+        batch_size, seq_len = input_ids.shape
+        attention_mask = batch.get("attention_mask")
+        max_new_tokens = generation_config.max_new_tokens
+        mask_len = seq_len + max_new_tokens if self.config.use_position_ids else seq_len
+        position_ids = append_last_valid_logits = None
+        if self.config.use_position_ids and attention_mask is None:
+            attention_mask = input_ids != -1
+            position_ids = torch.clamp(torch.cumsum(attention_mask.to(torch.int32), dim=-1) - 1, min=0)
+            append_last_valid_logits = attention_mask.long().sum(dim=-1) - 1
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, max_new_tokens))], dim=1)
+        if attention_mask is not None:
+            assert attention_mask.shape == (batch_size, mask_len)
+        return self.generate(
+            input_ids,
+            generation_config=generation_config,
+            attention_mask=attention_mask,
+            images=batch.get("images"),
+            image_masks=batch.get("image_masks"),
+            image_input_idx=batch.get("image_input_idx"),
+            position_ids=position_ids,
+            append_last_valid_logits=append_last_valid_logits,
+            **kwargs,
+        )
+
+    def patched_update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder=False, num_new_tokens=1):
+        if self.config.use_position_ids:
+            model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+            model_kwargs.pop("append_last_valid_logits", None)
+            for key in ("images", "image_masks", "image_input_idx"):
+                model_kwargs.pop(key, None)
         try:
-            rendered_prompt = processor.apply_chat_template(
-                [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        except (ValueError, TypeError):
-            rendered_prompt = prompt
-    inputs = processor(text=[rendered_prompt], images=[image], return_tensors="pt")
-    inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
-    generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    prompt_length = inputs.get("input_ids").shape[1] if inputs.get("input_ids") is not None else 0
-    new_tokens = generated[:, prompt_length:] if prompt_length else generated
-    if hasattr(processor, "batch_decode"):
-        return processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
-    return processor.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+            cache_name, cache = super(type(self), self)._extract_past_from_model_output(outputs)
+        except AttributeError:
+            cache_name, cache = "past_key_values", getattr(outputs, "past_key_values", None)
+        model_kwargs[cache_name] = cache
+        if "cache_position" in model_kwargs:
+            model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+        return model_kwargs
+
+    for name, value in GenerationMixin.__dict__.items():
+        if not name.startswith("__") and not hasattr(molmo_model_class, name):
+            setattr(molmo_model_class, name, value)
+    molmo_model_class.__init__ = patched_init
+    molmo_model_class.tie_weights = patched_tie_weights
+    molmo_model_class._supports_default_dynamic_cache = patched_supports_default_dynamic_cache
+    molmo_model_class.generate_from_batch = patched_generate_from_batch
+    molmo_model_class._update_model_kwargs_for_generation = patched_update_model_kwargs_for_generation
+    molmo_model_class.all_tied_weights_keys = {}
+    molmo_model_class._transformers_5_compat_patched = True
+    return molmo_model_class
+
+
+def _patch_paligemma_masks() -> None:
+    import transformers.models.paligemma.modeling_paligemma as paligemma_modeling
+    from transformers import PaliGemmaForConditionalGeneration
+    from transformers.masking_utils import create_masks_for_generate as generic_create_masks_for_generate
+
+    def patched_paligemma_create_masks_for_generate(
+        config, inputs_embeds, attention_mask, past_key_values, position_ids=None,
+        token_type_ids=None, pixel_values=None, is_training=None, is_first_iteration=None, **kwargs,
+    ):
+        return generic_create_masks_for_generate(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+
+    paligemma_modeling.create_causal_mask_mapping = patched_paligemma_create_masks_for_generate
+    PaliGemmaForConditionalGeneration.create_masks_for_generate = staticmethod(
+        patched_paligemma_create_masks_for_generate
+    )
+
+
+def _load_vlm_family(definition: dict, device: torch.device, revision: str | None) -> tuple[object, object, dict]:
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
+
+    family = definition.get("family", definition.get("model_family", "auto"))
+    model_name = definition["model_name"]
+    dtype = _inference_dtype(device)
+    revision_kwargs = _revision_kwargs(revision)
+    processor = None
+    resources: dict[str, object] = {}
+
+    if family == "paligemma":
+        from transformers import PaliGemmaForConditionalGeneration, PaliGemmaProcessor
+
+        _patch_paligemma_masks()
+        model_config = AutoConfig.from_pretrained(model_name, **revision_kwargs)
+        model_config.text_config.use_bidirectional_attention = False
+        processor = PaliGemmaProcessor.from_pretrained(model_name, **revision_kwargs)
+        model = PaliGemmaForConditionalGeneration.from_pretrained(
+            model_name, config=model_config, dtype=dtype, attn_implementation="eager", **revision_kwargs
+        ).to(device)
+    elif family == "llava_onevision":
+        from transformers import LlavaOnevisionForConditionalGeneration
+
+        processor = AutoProcessor.from_pretrained(model_name, use_fast=False, **revision_kwargs)
+        kwargs = {"dtype": dtype, **revision_kwargs}
+        if device.type == "cuda":
+            kwargs["device_map"] = device
+        model = LlavaOnevisionForConditionalGeneration.from_pretrained(model_name, **kwargs)
+        if device.type != "cuda":
+            model = model.to(device)
+    elif family == "idefics2":
+        from transformers import Idefics2ForConditionalGeneration, Idefics2Processor
+
+        processor = Idefics2Processor.from_pretrained(model_name, **revision_kwargs)
+        kwargs = {"dtype": dtype, **revision_kwargs}
+        if device.type == "cuda":
+            kwargs["device_map"] = device
+        model = Idefics2ForConditionalGeneration.from_pretrained(model_name, **kwargs)
+        if device.type != "cuda":
+            model = model.to(device)
+    elif family == "smolvlm":
+        processor = AutoProcessor.from_pretrained(model_name, **revision_kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name, dtype=dtype, **revision_kwargs
+        ).to(device)
+    elif family == "internvl":
+        processor = AutoProcessor.from_pretrained(model_name, **revision_kwargs)
+        kwargs = {"dtype": dtype, **revision_kwargs}
+        if device.type == "cuda":
+            kwargs["device_map"] = device
+        model = AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
+        if device.type != "cuda":
+            model = model.to(device)
+    elif family == "molmo":
+        model_path = predownload_molmo_snapshot(model_name, revision)
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=False, local_files_only=True
+        )
+        molmo_model_class = get_molmo_model_class(model_path)
+        kwargs = {"dtype": dtype, "local_files_only": True}
+        if device.type == "cuda":
+            kwargs["device_map"] = device
+        model = molmo_model_class.from_pretrained(model_path, **kwargs)
+        if device.type != "cuda":
+            model = model.to(device)
+    elif family == "openflamingo":
+        try:
+            from huggingface_hub import hf_hub_download
+            from open_flamingo import create_model_and_transforms
+        except ImportError as exc:
+            raise ImportError(
+                "OpenFlamingo support requires optional dependencies. Install with: pip install open-flamingo huggingface_hub"
+            ) from exc
+        model, image_processor, tokenizer = create_model_and_transforms(
+            clip_vision_encoder_path=definition.get("clip_vision_encoder_path", "ViT-L-14"),
+            clip_vision_encoder_pretrained=definition.get("clip_vision_encoder_pretrained", "openai"),
+            lang_encoder_path=definition.get("lang_encoder_path", "togethercomputer/RedPajama-INCITE-Base-3B-v1"),
+            tokenizer_path=definition.get("tokenizer_path", "togethercomputer/RedPajama-INCITE-Base-3B-v1"),
+            cross_attn_every_n_layers=definition.get("cross_attn_every_n_layers", 2),
+        )
+        checkpoint_path = hf_hub_download(
+            repo_id=model_name,
+            filename=definition.get("checkpoint_filename", "checkpoint.pt"),
+            **revision_kwargs,
+        )
+        ensure_torch_serialization_compat()
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        _resize_openflamingo_embeddings_for_checkpoint(model, state_dict)
+        model.load_state_dict(state_dict, strict=False)
+        del state_dict
+        model = model.to(device=device, dtype=torch.float32).eval()
+        resources.update({"image_processor": image_processor, "tokenizer": tokenizer})
+    else:
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, **revision_kwargs)
+        kwargs = {"dtype": dtype, "trust_remote_code": True, **revision_kwargs}
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
+        except (ValueError, OSError):
+            model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        model = model.to(device)
+    return model.eval(), processor, resources
+
+
+def _decode_new_tokens(processor, token_ids, *, tokenizer=None) -> str:
+    if token_ids.ndim == 1:
+        token_ids = token_ids.unsqueeze(0)
+    decoder = processor if processor is not None and hasattr(processor, "batch_decode") else tokenizer
+    if decoder is None:
+        raise RuntimeError("The VLM processor did not provide a decoder.")
+    try:
+        decoded = decoder.batch_decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        decoded = decoder.batch_decode(token_ids, skip_special_tokens=True)
+    return decoded[0].strip()
+
+
+def _run_vlm_model(
+    key: str,
+    definition: dict,
+    images: dict[str, object],
+    prompt: str,
+    generation: dict,
+    device: torch.device,
+    revision: str | None,
+) -> dict[str, str]:
+    model = processor = None
+    resources: dict[str, object] = {}
+    model_inputs = generated_ids = None
+    try:
+        model, processor, resources = _load_vlm_family(definition, device, revision)
+        family = definition.get("family", definition.get("model_family", "auto"))
+        generate_kwargs = _generation_kwargs(generation)
+        outputs: dict[str, str] = {}
+        for image_key, image in images.items():
+            input_len = 0
+            tokenizer = resources.get("tokenizer")
+            if family == "paligemma":
+                model_inputs = processor(images=image, text=f"<image>{prompt}", return_tensors="pt")
+            elif family in {"llava_onevision", "idefics2", "smolvlm"}:
+                conversation = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+                prompt_text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+                processor_kwargs = {"images": image, "text": prompt_text, "return_tensors": "pt"}
+                if family == "smolvlm":
+                    processor_kwargs.update({"padding": True, "truncation": True})
+                model_inputs = processor(**processor_kwargs)
+            elif family == "internvl":
+                conversation = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+                model_inputs = processor.apply_chat_template(
+                    conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+                )
+            elif family == "molmo":
+                processed = processor.process(images=[image], text=prompt)
+                model_inputs = {
+                    key_name: value.unsqueeze(0) if torch.is_tensor(value) and value.ndim == 1 else value
+                    for key_name, value in processed.items()
+                }
+            elif family == "openflamingo":
+                image_processor = resources["image_processor"]
+                tokenizer = resources["tokenizer"]
+                vision_x = image_processor(image).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                vision_x = vision_x.to(device=device, dtype=torch.float32)
+                tokenizer.padding_side = "left"
+                prompt_text = f"<image>{prompt}<|endofchunk|>"
+                token_batch = tokenizer([prompt_text], return_tensors="pt")
+                lang_x = token_batch["input_ids"].to(device)
+                attention_mask = token_batch["attention_mask"].to(device)
+                input_len = lang_x.shape[-1]
+                with torch.inference_mode():
+                    generated_ids = model.generate(
+                        vision_x=vision_x, lang_x=lang_x, attention_mask=attention_mask, **generate_kwargs
+                    )
+                outputs[image_key] = _decode_new_tokens(None, generated_ids[:, input_len:], tokenizer=tokenizer)
+                del vision_x, lang_x, attention_mask, token_batch
+                continue
+            else:
+                rendered_prompt = prompt
+                if hasattr(processor, "apply_chat_template"):
+                    try:
+                        rendered_prompt = processor.apply_chat_template(
+                            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],
+                            tokenize=False, add_generation_prompt=True,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                model_inputs = processor(text=[rendered_prompt], images=[image], return_tensors="pt")
+
+            model_inputs = _move_inputs_to_model(model_inputs, model, _inference_dtype(device))
+            input_ids = model_inputs.get("input_ids")
+            input_len = input_ids.shape[-1] if torch.is_tensor(input_ids) else 0
+            if family == "molmo":
+                molmo_kwargs = dict(generate_kwargs)
+                molmo_kwargs.update({"stop_strings": "<|endoftext|>", "use_cache": True})
+                with torch.inference_mode():
+                    generated_ids = model.generate_from_batch(
+                        model_inputs, GenerationConfig(**molmo_kwargs), tokenizer=processor.tokenizer
+                    )
+                outputs[image_key] = processor.tokenizer.decode(
+                    generated_ids[0, input_len:], skip_special_tokens=True
+                ).strip()
+            else:
+                with torch.inference_mode():
+                    generated_ids = model.generate(**model_inputs, **generate_kwargs)
+                outputs[image_key] = _decode_new_tokens(
+                    processor, generated_ids[:, input_len:] if input_len else generated_ids, tokenizer=tokenizer
+                )
+            del model_inputs, generated_ids
+            model_inputs = generated_ids = None
+        return outputs
+    finally:
+        if generated_ids is not None:
+            del generated_ids
+        if model_inputs is not None:
+            del model_inputs
+        if model is not None:
+            del model
+        if processor is not None:
+            del processor
+        resources.clear()
+        if device.type == "cuda":
+            try:
+                gc.collect()
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+
+def _inference_image_labels(config: dict) -> dict[str, Path]:
+    inputs = config["inputs"]
+    if "clean" in inputs and "adversarial" in inputs:
+        return {"clean": Path(inputs["clean"]), "adversarial": Path(inputs["adversarial"])}
+    return {"image": Path(inputs["image"])}
 
 
 def run_vlm_inference(config: dict, event_callback=None) -> dict:
     from PIL import Image
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
 
     _, keys = _vlm_model_keys(config)
     if isinstance(config.get("models"), dict):
         transfer = config["models"].get("transfer", [])
         keys = [transfer] if isinstance(transfer, str) else list(transfer)
     model_definitions = {**VLM_INFERENCE_MODEL_DEFINITIONS, **_attack_model_specs()}
-    image_paths = {"image": Path(config["inputs"]["image"])}
-    for field in ("clean", "adversarial"):
-        if field in config["inputs"]:
-            image_paths[field] = Path(config["inputs"][field])
-    outputs = {}
-    errors = []
+    image_paths = _inference_image_labels(config)
+    images = {}
+    for label, image_path in image_paths.items():
+        with Image.open(image_path) as image:
+            images[label] = image.convert("RGB")
+    outputs: dict[str, dict[str, str]] = {}
+    errors: list[dict] = []
+    generation = config["generation"]
+    device = torch.device(config.get("transfer_device", config.get("device", "cuda:0")))
     for key in keys:
+        model = model_definitions.get(key)
+        if model is None:
+            error = {
+                "model_key": key,
+                "type": "ValueError",
+                "message": f"Unknown VLM inference model key: {key}",
+                "traceback": "",
+            }
+            errors.append(error)
+            continue
+        definition = model
         try:
-            definition = model_definitions[key]
-            device = torch.device(config.get("device", "cuda:0"))
             if event_callback is not None:
                 event_callback("model_started", model_key=key, model_name=definition["model_name"], device=str(device))
-            processor = AutoProcessor.from_pretrained(definition["model_name"], trust_remote_code=True)
-            try:
-                model = AutoModelForImageTextToText.from_pretrained(definition["model_name"], trust_remote_code=True).to(device)
-            except (ValueError, OSError):
-                model = AutoModelForCausalLM.from_pretrained(definition["model_name"], trust_remote_code=True).to(device)
-            model.eval()
-            model_outputs = {}
-            for image_key, image_path in image_paths.items():
-                with Image.open(image_path) as image:
-                    model_outputs[image_key] = _generic_vlm_output(
-                        model, processor, image.convert("RGB"), config["prompt"], device,
-                        int(config["generation"]["max_new_tokens"]), definition.get("family", "auto")
-                    )
+            model_outputs = _run_vlm_model(
+                key, definition, images, config["prompt"], generation, device,
+                _requested_revision(config, key, definition["model_name"]),
+            )
             outputs[key] = model_outputs
             if event_callback is not None:
                 event_callback("model_completed", model_key=key, output_lengths={name: len(value) for name, value in model_outputs.items()})
         except Exception as exc:
-            errors.append({"model_key": key, "type": type(exc).__name__, "message": str(exc)})
+            error_traceback = traceback.format_exc()
+            error = {
+                "model_key": key,
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": error_traceback,
+            }
+            errors.append(error)
             if event_callback is not None:
-                event_callback("error", stage="inference", model_key=key, message=str(exc))
+                event_callback(
+                    "error",
+                    stage="inference",
+                    model_key=key,
+                    message=str(exc),
+                    traceback=error_traceback,
+                )
+    paired_metrics = {}
+    for key, values in outputs.items():
+        if "clean" in values and "adversarial" in values:
+            paired_metrics[key] = _text_metrics(values["clean"], values["adversarial"])
+        elif "image" in values:
+            paired_metrics[key] = {"image_length": len(values["image"]), "image_empty": not bool(values["image"])}
     return {
         "metrics": {
             "models_requested": len(keys),
             "models_succeeded": len(outputs),
+            "models_failed": len(errors),
+            "zero_success": not outputs,
+            "partial_success": bool(outputs) and bool(errors),
             "textual_change_metrics_are_behavioral": True,
-            "per_model_output_changes": {
-                key: {
-                    "clean_output_length": len(value.get("clean", value.get("image", ""))),
-                    "adversarial_output_length": len(value.get("adversarial", value.get("image", ""))),
-                    "empty_clean": not bool(value.get("clean", value.get("image", ""))),
-                    "empty_adversarial": not bool(value.get("adversarial", value.get("image", ""))),
-                }
-                for key, value in outputs.items()
-                if "clean" in value or "adversarial" in value
-            },
+            "per_model_output_changes": paired_metrics,
         },
         "raw_outputs": outputs,
         "artifacts": {},
@@ -1094,17 +1611,30 @@ def run_vlm_pipeline(config: dict, event_callback=None) -> dict:
     transfer_keys = config["models"].get("transfer", []) if isinstance(config.get("models"), dict) else []
     if isinstance(transfer_keys, str):
         transfer_keys = [transfer_keys]
-    clean_path = Path(config["inputs"]["image"])
+    clean_path = Path(config["inputs"].get("clean", config["inputs"]["image"]))
     adv_path = Path(attack_result["artifacts"]["adversarial_image"])
     transfer_config = dict(config)
     transfer_config["inputs"] = {"image": str(clean_path), "clean": str(clean_path), "adversarial": str(adv_path)}
     transfer_config["models"] = list(transfer_keys)
+    transfer_config["device"] = config.get("transfer_device", config.get("device", "cuda:0"))
+    transfer_config.pop("devices", None)
     transfer = run_vlm_inference(transfer_config, event_callback)
+    attack_errors = list(attack_result.get("errors", []))
+    transfer_errors = list(transfer.get("errors", []))
+    for error in attack_errors:
+        error.setdefault("stage", "attack")
+    for error in transfer_errors:
+        error.setdefault("stage", "transfer")
     return {
-        "metrics": {**attack_result["metrics"], "transfer_models_succeeded": transfer["metrics"]["models_succeeded"]},
+        "metrics": {
+            "attack": attack_result["metrics"],
+            "transfer": transfer["metrics"],
+            "transfer_models_succeeded": transfer["metrics"]["models_succeeded"],
+        },
         "raw_outputs": {"attack": attack_result["raw_outputs"], "transfer": transfer["raw_outputs"]},
         "artifacts": attack_result["artifacts"],
-        "errors": transfer["errors"],
+        "errors": [*attack_errors, *transfer_errors],
+        "error_details": {"attack": attack_errors, "transfer": transfer_errors},
     }
 
 
@@ -1114,12 +1644,20 @@ def main() -> None:
 
     print("Canonical CLI: /home/jmadden2/anaconda3/envs/llm-misuse/bin/python src/experiment_runner.py run <CONFIG.json>")
     current_specs = _attack_model_specs()
+    selected_spec_groups = {
+        "siglip2": SIGLIP2_MODEL_SPECS,
+        "siglip": SIGLIP_MODEL_SPECS,
+        "clip": CLIP_MODEL_SPECS,
+    }
+    selected_specs = selected_spec_groups.get(SPEC, [current_specs["llava_1_5_7b_hf"]])
+    selected_models = [spec["key"] for spec in selected_specs]
     manifest = {
         "schema_version": 1,
         "name": f"legacy-vlm-{img_idx}-{SPEC}-{NUM}",
         "workflow": "vlm_attack",
         "inputs": {"image": str(SOURCE_IMAGE_PATH)},
-        "models": [spec["key"] for spec in current_specs.values() if spec.get("group") == SPEC] if SPEC in {"clip", "siglip", "siglip2"} else ["llava_1_5_7b_hf"],
+        "models": selected_models,
+        "devices": [spec["device"] for spec in selected_specs],
         "prompt": USER_PROMPT,
         "attack": {"epsilon": EPSILON, "alpha": ALPHA, "steps": STEPS, "mode": ATTACK_MODE, "target_loss_mode": TARGET_LOSS_MODE, "target_texts": TARGET_TEXTS, "cross_model_optimization_mode": CROSS_MODEL_OPTIMIZATION_MODE, "softminimax_temperature": CROSS_MODEL_SOFTMINIMAX_TEMPERATURE},
     }

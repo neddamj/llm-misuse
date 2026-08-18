@@ -74,3 +74,19 @@ VLM workflows must run with the `llm-misuse` Conda environment:
 ```
 
 Do not use bare `python` or the base Conda environment for experiment execution. Install dependencies and troubleshoot only in the environment belonging to the selected workflow; do not modify the other workflow environment. Environment-neutral commands such as `list-models`, `validate`, and deterministic `summarize` do not import model libraries and may use either workflow interpreter.
+
+### Batch environment rule
+
+Every batch must be homogeneous: all entries must be OCR workflows or all entries must be VLM workflows. The runner validates every manifest before starting the first run and rejects a mixed batch. Use the OCR interpreter for OCR batches:
+
+```bash
+/home/jmadden2/anaconda3/envs/ocr/bin/python src/experiment_runner.py batch BATCH.json
+```
+
+Use the `llm-misuse` interpreter for VLM batches:
+
+```bash
+/home/jmadden2/anaconda3/envs/llm-misuse/bin/python src/experiment_runner.py batch BATCH.json --fail-fast
+```
+
+VLM attack workers use the explicit unique devices in `devices`; VLM pipeline transfer inference is sequential and uses `transfer_device` (defaulting to `device`). VLM inference has no worker-device list and uses only `device`. OCR multi-model inference resolves each model's own OCR prompt; do not set a global Donut prompt for an OCR inference manifest. `qianfan_ocr` and `hunyuan_ocr` are listed for provenance but unavailable in the canonical OCR environment because their required Transformers classes are not installed.
