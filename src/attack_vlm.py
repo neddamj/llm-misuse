@@ -4,6 +4,7 @@ import torch
 import torch.multiprocessing as mp
 from torchvision import transforms
 from tqdm import tqdm
+from transformers import GenerationConfig
 from attacks.common import (
     canonicalize_cuda_device,
     find_repo_root,
@@ -429,7 +430,7 @@ def run_eot_attack_step(
     )
 
 
-def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def run_attack(workers: list[dict], x_clean: torch.Tensor, event_callback=None) -> tuple[torch.Tensor, torch.Tensor]:
     delta = torch.zeros_like(x_clean, requires_grad=True)
     optimizer = torch.optim.AdamW([delta], lr=ALPHA, weight_decay=0.0)
     progress = tqdm(range(STEPS))
@@ -465,6 +466,14 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
                         mean_loss,
                     )
                 )
+                if event_callback is not None:
+                    event_callback(
+                        "optimization_metric",
+                        step=step_index + 1,
+                        aggregate_loss=aggregate_loss,
+                        worst_model=worst_key,
+                        worst_loss=worst_loss,
+                    )
             continue
 
         eot_step_results, eot_aggregate_loss = run_eot_attack_step(workers, x_clean, delta)
@@ -489,6 +498,14 @@ def run_attack(workers: list[dict], x_clean: torch.Tensor) -> tuple[torch.Tensor
                     prefix="eot_",
                 )
             )
+            if event_callback is not None:
+                event_callback(
+                    "optimization_metric",
+                    step=step_index + 1,
+                    aggregate_loss=eot_aggregate_loss,
+                    worst_model=eot_worst_key,
+                    worst_loss=eot_worst_loss,
+                )
 
     return torch.clamp(x_clean + delta, 0.0, 1.0).detach(), delta.detach()
 
@@ -672,7 +689,7 @@ def build_report_lines(
     return lines
 
 
-def main() -> None:
+def _legacy_main() -> None:
     print(f"Repo root: {REPO_ROOT}")
     print(f"Results dir: {RESULTS_DIR}")
     print(f"Source image: {SOURCE_IMAGE_PATH}")
@@ -775,6 +792,340 @@ def main() -> None:
         print(f"[Info] Reusable adversarial image path: {OUTPUT_ADV_PATH.resolve()}")
     finally:
         shutdown_workers(workers)
+
+
+VLM_INFERENCE_MODEL_DEFINITIONS = {
+    "paligemma": {"model_name": "google/paligemma2-3b-mix-448", "family": "paligemma"},
+    "llava_onevision": {"model_name": "llava-hf/llava-onevision-qwen2-7b-ov-hf", "family": "llava_onevision"},
+    "idefics2": {"model_name": "HuggingFaceM4/idefics2-8b", "family": "idefics2"},
+    "smolvlm": {"model_name": "HuggingFaceTB/SmolVLM-Instruct", "family": "smolvlm"},
+    "internvl3_1b_hf": {"model_name": "OpenGVLab/InternVL3-1B-hf", "family": "internvl"},
+    "openflamingo_4b": {"model_name": "openflamingo/OpenFlamingo-4B-vitl-rpj3b", "family": "openflamingo"},
+    "molmo_7b_d_0924": {"model_name": "allenai/Molmo-7B-D-0924", "family": "molmo"},
+}
+
+
+def _vlm_model_keys(config: dict) -> tuple[str, list[str]]:
+    selected = config.get("models")
+    if isinstance(selected, str):
+        return selected, [selected]
+    if isinstance(selected, list):
+        if not selected:
+            raise ValueError("At least one VLM model must be selected.")
+        return selected[0], list(selected)
+    if isinstance(selected, dict):
+        attack_key = selected.get("attack")
+        transfer = selected.get("transfer", [])
+        if not isinstance(attack_key, str):
+            raise ValueError("VLM pipeline models.attack must be a model key.")
+        if isinstance(transfer, str):
+            transfer = [transfer]
+        if not isinstance(transfer, list):
+            raise ValueError("VLM pipeline models.transfer must be a list.")
+        return attack_key, [attack_key, *transfer]
+    raise ValueError("VLM models must be a model key, list, or pipeline object.")
+
+
+def _attack_model_specs() -> dict[str, dict]:
+    return {
+        spec["key"]: dict(spec)
+        for spec in [*SIGLIP2_MODEL_SPECS, *SIGLIP_MODEL_SPECS, *CLIP_MODEL_SPECS]
+    }
+
+
+def _configure_vlm_globals(config: dict, keys: list[str]) -> dict[str, object]:
+    global MODEL_SPECS, USER_PROMPT, ATTACK_MODE, TARGET_TEXTS, TARGET_LOSS_MODE
+    global CROSS_MODEL_OPTIMIZATION_MODE, CROSS_MODEL_SOFTMINIMAX_TEMPERATURE
+    global EPSILON, ALPHA, STEPS, USE_EOT, EOT_TRAIN_SAMPLES, EOT_EVAL_SAMPLES
+    global EOT_ROTATION_DEGREES, EOT_PERSPECTIVE_DISTORTION, EOT_CROP_SCALE, EOT_CROP_RATIO
+    global EOT_COLOR_JITTER_BRIGHTNESS, EOT_COLOR_JITTER_CONTRAST, EOT_COLOR_JITTER_SATURATION
+    global EOT_GAUSSIAN_NOISE_STD
+    names = (
+        "MODEL_SPECS", "USER_PROMPT", "ATTACK_MODE", "TARGET_TEXTS", "TARGET_LOSS_MODE",
+        "CROSS_MODEL_OPTIMIZATION_MODE", "CROSS_MODEL_SOFTMINIMAX_TEMPERATURE", "EPSILON",
+        "ALPHA", "STEPS", "USE_EOT", "EOT_TRAIN_SAMPLES", "EOT_EVAL_SAMPLES",
+        "EOT_ROTATION_DEGREES", "EOT_PERSPECTIVE_DISTORTION", "EOT_CROP_SCALE", "EOT_CROP_RATIO",
+        "EOT_COLOR_JITTER_BRIGHTNESS", "EOT_COLOR_JITTER_CONTRAST", "EOT_COLOR_JITTER_SATURATION",
+        "EOT_GAUSSIAN_NOISE_STD",
+    )
+    previous = {name: globals()[name] for name in names}
+    spec_map = _attack_model_specs()
+    unknown = [key for key in keys if key not in spec_map]
+    if unknown:
+        raise ValueError(f"VLM attack model key(s) are not supported by the attack workers: {', '.join(unknown)}")
+    devices = config.get("devices", [config.get("device", "cuda:0")])
+    model_specs = []
+    for index, key in enumerate(keys):
+        spec = dict(spec_map[key])
+        spec["device"] = devices[index]
+        model_specs.append(spec)
+    attack = config["attack"]
+    eot = config["eot"]
+    MODEL_SPECS = model_specs
+    USER_PROMPT = config["prompt"]
+    ATTACK_MODE = attack["mode"]
+    TARGET_TEXTS = list(attack.get("target_texts", []))
+    TARGET_LOSS_MODE = attack["target_loss_mode"]
+    CROSS_MODEL_OPTIMIZATION_MODE = attack["cross_model_optimization_mode"]
+    CROSS_MODEL_SOFTMINIMAX_TEMPERATURE = float(attack["softminimax_temperature"])
+    EPSILON = float(attack["epsilon"])
+    ALPHA = float(attack["alpha"])
+    STEPS = int(attack["steps"])
+    USE_EOT = bool(eot["enabled"])
+    EOT_TRAIN_SAMPLES = int(eot["train_samples"])
+    EOT_EVAL_SAMPLES = int(eot["eval_samples"])
+    EOT_ROTATION_DEGREES = float(eot["rotation_degrees"])
+    EOT_PERSPECTIVE_DISTORTION = float(eot["perspective_distortion"])
+    EOT_CROP_SCALE = tuple(eot["crop_scale"])
+    EOT_CROP_RATIO = tuple(eot["crop_ratio"])
+    EOT_COLOR_JITTER_BRIGHTNESS = float(eot["color_jitter_brightness"])
+    EOT_COLOR_JITTER_CONTRAST = float(eot["color_jitter_contrast"])
+    EOT_COLOR_JITTER_SATURATION = float(eot["color_jitter_saturation"])
+    EOT_GAUSSIAN_NOISE_STD = float(eot["gaussian_noise_std"])
+    return previous
+
+
+def _restore_vlm_globals(previous: dict[str, object]) -> None:
+    globals().update(previous)
+
+
+def _summarize_vlm_metrics(clean_results: dict[str, dict], adv_results: dict[str, dict]) -> dict:
+    clean_losses = {key: value["loss"] for key, value in clean_results.items() if value.get("loss") is not None}
+    adv_losses = {key: value["loss"] for key, value in adv_results.items() if value.get("loss") is not None}
+    metrics = {
+        "clean_losses": clean_losses,
+        "adversarial_losses": adv_losses,
+        "loss_changes": {key: adv_losses[key] - clean_losses[key] for key in clean_losses.keys() & adv_losses.keys()},
+        "clean_output_lengths": {key: len(value.get("generation", "")) for key, value in clean_results.items()},
+        "adversarial_output_lengths": {key: len(value.get("generation", "")) for key, value in adv_results.items()},
+        "empty_output_flags": {
+            "clean": {key: not bool(value.get("generation")) for key, value in clean_results.items()},
+            "adversarial": {key: not bool(value.get("generation")) for key, value in adv_results.items()},
+        },
+        "textual_change_metrics_are_behavioral": True,
+    }
+    changes = metrics["loss_changes"]
+    if changes:
+        metrics["aggregate_loss_change"] = sum(changes.values()) / len(changes)
+        metrics["worst_model_loss_change"] = max(changes.values())
+    return metrics
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def run_vlm_attack(config: dict, event_callback=None) -> dict:
+    attack_key, keys = _vlm_model_keys(config)
+    if isinstance(config.get("models"), dict):
+        keys = [attack_key]
+    previous = _configure_vlm_globals(config, keys)
+    workers: list[dict] = []
+    try:
+        device = torch.device(config.get("device", "cuda:0"))
+        torch.manual_seed(int(config.get("seed", 0)))
+        x_clean = load_image_tensor(Path(config["inputs"]["image"]), torch.device("cpu"), ATTACK_IMAGE_SIZE)
+        worker_config = {
+            "user_prompt": USER_PROMPT,
+            "attack_mode": ATTACK_MODE,
+            "target_texts": TARGET_TEXTS,
+            "target_loss_mode": TARGET_LOSS_MODE,
+            "max_new_tokens": int(config["generation"]["max_new_tokens"]),
+            "model_input_size": MODEL_INPUT_SIZE,
+            "attack_image_size": ATTACK_IMAGE_SIZE,
+            "clip_mean": CLIP_MEAN,
+            "clip_std": CLIP_STD,
+        }
+        ctx = mp.get_context("spawn")
+        workers = start_workers(ctx, MODEL_SPECS, worker_config)
+        if event_callback is not None:
+            for spec in MODEL_SPECS:
+                event_callback("model_started", model_key=spec["key"], model_name=spec["model_name"], device=spec["device"])
+            event_callback("models_ready", model_keys=keys)
+            event_callback("stage_started", stage="clean_evaluation")
+        clean_results = evaluate_workers(workers, x_clean)
+        if ATTACK_MODE == "untargeted":
+            set_workers_untargeted_references(workers, clean_results)
+            clean_losses = evaluate_workers_loss_only(workers, x_clean)
+            for key, loss in clean_losses.items():
+                clean_results[key]["loss"] = loss
+        clean_eot_summary = evaluate_workers_eot(workers, x_clean, num_samples=EOT_EVAL_SAMPLES) if USE_EOT else None
+        if event_callback is not None:
+            event_callback("stage_started", stage="optimization")
+        x_final, delta = run_attack(workers, x_clean, event_callback)
+        adv_results = evaluate_workers(workers, x_final)
+        adv_eot_summary = evaluate_workers_eot(workers, x_final, num_samples=EOT_EVAL_SAMPLES) if USE_EOT else None
+        artifact_dir = Path(config["_artifact_dir"])
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        adv_path = artifact_dir / "adversarial.png"
+        noise_path = artifact_dir / "perturbation.png"
+        transforms.ToPILImage()(x_final.squeeze(0).cpu()).save(adv_path)
+        save_noise_visualization(delta, noise_path)
+        metrics = _summarize_vlm_metrics(clean_results, adv_results)
+        metrics.update(
+            {
+                "attack_mode": ATTACK_MODE,
+                "epsilon": EPSILON,
+                "perturbation_inf": float(delta.abs().max().item()),
+                "eot_enabled": USE_EOT,
+            }
+        )
+        if clean_eot_summary is not None and adv_eot_summary is not None:
+            metrics["eot_clean_worst_loss"] = clean_eot_summary["worst_loss"]
+            metrics["eot_adversarial_worst_loss"] = adv_eot_summary["worst_loss"]
+            metrics["eot_samples"] = EOT_EVAL_SAMPLES
+        if event_callback is not None:
+            for key, value in adv_results.items():
+                event_callback("model_completed", model_key=key, output_lengths={"clean": len(clean_results[key]["generation"]), "adversarial": len(value["generation"])})
+        if ATTACK_MODE == "targeted":
+            targets = {_normalized_text(value) for value in TARGET_TEXTS}
+            metrics["target_text_matches"] = {
+                key: _normalized_text(value["generation"]) in targets
+                for key, value in adv_results.items()
+            }
+        return {
+            "metrics": metrics,
+            "raw_outputs": {
+                "clean": {key: value["generation"] for key, value in clean_results.items()},
+                "adversarial": {key: value["generation"] for key, value in adv_results.items()},
+            },
+            "artifacts": {"adversarial_image": str(adv_path), "perturbation_visualization": str(noise_path)},
+            "errors": [],
+        }
+    finally:
+        shutdown_workers(workers)
+        _restore_vlm_globals(previous)
+
+
+def _generic_vlm_output(model, processor, image, prompt: str, device: torch.device, max_new_tokens: int, family: str) -> str:
+    if family == "molmo" and hasattr(processor, "process") and hasattr(model, "generate_from_batch"):
+        processed = processor.process(images=[image], text=prompt)
+        inputs = {
+            key: value.unsqueeze(0).to(device) if torch.is_tensor(value) and value.ndim == 1 else value.to(device) if torch.is_tensor(value) else value
+            for key, value in processed.items()
+        }
+        generated = model.generate_from_batch(inputs, GenerationConfig(max_new_tokens=max_new_tokens, stop_strings="<|endoftext|>"), tokenizer=processor.tokenizer)
+        return processor.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+    rendered_prompt = prompt
+    if hasattr(processor, "apply_chat_template"):
+        try:
+            rendered_prompt = processor.apply_chat_template(
+                [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except (ValueError, TypeError):
+            rendered_prompt = prompt
+    inputs = processor(text=[rendered_prompt], images=[image], return_tensors="pt")
+    inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
+    generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_length = inputs.get("input_ids").shape[1] if inputs.get("input_ids") is not None else 0
+    new_tokens = generated[:, prompt_length:] if prompt_length else generated
+    if hasattr(processor, "batch_decode"):
+        return processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+    return processor.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+
+
+def run_vlm_inference(config: dict, event_callback=None) -> dict:
+    from PIL import Image
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
+
+    _, keys = _vlm_model_keys(config)
+    if isinstance(config.get("models"), dict):
+        transfer = config["models"].get("transfer", [])
+        keys = [transfer] if isinstance(transfer, str) else list(transfer)
+    model_definitions = {**VLM_INFERENCE_MODEL_DEFINITIONS, **_attack_model_specs()}
+    image_paths = {"image": Path(config["inputs"]["image"])}
+    for field in ("clean", "adversarial"):
+        if field in config["inputs"]:
+            image_paths[field] = Path(config["inputs"][field])
+    outputs = {}
+    errors = []
+    for key in keys:
+        try:
+            definition = model_definitions[key]
+            device = torch.device(config.get("device", "cuda:0"))
+            if event_callback is not None:
+                event_callback("model_started", model_key=key, model_name=definition["model_name"], device=str(device))
+            processor = AutoProcessor.from_pretrained(definition["model_name"], trust_remote_code=True)
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(definition["model_name"], trust_remote_code=True).to(device)
+            except (ValueError, OSError):
+                model = AutoModelForCausalLM.from_pretrained(definition["model_name"], trust_remote_code=True).to(device)
+            model.eval()
+            model_outputs = {}
+            for image_key, image_path in image_paths.items():
+                with Image.open(image_path) as image:
+                    model_outputs[image_key] = _generic_vlm_output(
+                        model, processor, image.convert("RGB"), config["prompt"], device,
+                        int(config["generation"]["max_new_tokens"]), definition.get("family", "auto")
+                    )
+            outputs[key] = model_outputs
+            if event_callback is not None:
+                event_callback("model_completed", model_key=key, output_lengths={name: len(value) for name, value in model_outputs.items()})
+        except Exception as exc:
+            errors.append({"model_key": key, "type": type(exc).__name__, "message": str(exc)})
+            if event_callback is not None:
+                event_callback("error", stage="inference", model_key=key, message=str(exc))
+    return {
+        "metrics": {
+            "models_requested": len(keys),
+            "models_succeeded": len(outputs),
+            "textual_change_metrics_are_behavioral": True,
+            "per_model_output_changes": {
+                key: {
+                    "clean_output_length": len(value.get("clean", value.get("image", ""))),
+                    "adversarial_output_length": len(value.get("adversarial", value.get("image", ""))),
+                    "empty_clean": not bool(value.get("clean", value.get("image", ""))),
+                    "empty_adversarial": not bool(value.get("adversarial", value.get("image", ""))),
+                }
+                for key, value in outputs.items()
+                if "clean" in value or "adversarial" in value
+            },
+        },
+        "raw_outputs": outputs,
+        "artifacts": {},
+        "errors": errors,
+    }
+
+
+def run_vlm_pipeline(config: dict, event_callback=None) -> dict:
+    attack_result = run_vlm_attack(config, event_callback)
+    transfer_keys = config["models"].get("transfer", []) if isinstance(config.get("models"), dict) else []
+    if isinstance(transfer_keys, str):
+        transfer_keys = [transfer_keys]
+    clean_path = Path(config["inputs"]["image"])
+    adv_path = Path(attack_result["artifacts"]["adversarial_image"])
+    transfer_config = dict(config)
+    transfer_config["inputs"] = {"image": str(clean_path), "clean": str(clean_path), "adversarial": str(adv_path)}
+    transfer_config["models"] = list(transfer_keys)
+    transfer = run_vlm_inference(transfer_config, event_callback)
+    return {
+        "metrics": {**attack_result["metrics"], "transfer_models_succeeded": transfer["metrics"]["models_succeeded"]},
+        "raw_outputs": {"attack": attack_result["raw_outputs"], "transfer": transfer["raw_outputs"]},
+        "artifacts": attack_result["artifacts"],
+        "errors": transfer["errors"],
+    }
+
+
+def main() -> None:
+    from experiment_runner import execute_run
+    from workflow_contract import resolve_manifest
+
+    print("Canonical CLI: /home/jmadden2/anaconda3/envs/llm-misuse/bin/python src/experiment_runner.py run <CONFIG.json>")
+    current_specs = _attack_model_specs()
+    manifest = {
+        "schema_version": 1,
+        "name": f"legacy-vlm-{img_idx}-{SPEC}-{NUM}",
+        "workflow": "vlm_attack",
+        "inputs": {"image": str(SOURCE_IMAGE_PATH)},
+        "models": [spec["key"] for spec in current_specs.values() if spec.get("group") == SPEC] if SPEC in {"clip", "siglip", "siglip2"} else ["llava_1_5_7b_hf"],
+        "prompt": USER_PROMPT,
+        "attack": {"epsilon": EPSILON, "alpha": ALPHA, "steps": STEPS, "mode": ATTACK_MODE, "target_loss_mode": TARGET_LOSS_MODE, "target_texts": TARGET_TEXTS, "cross_model_optimization_mode": CROSS_MODEL_OPTIMIZATION_MODE, "softminimax_temperature": CROSS_MODEL_SOFTMINIMAX_TEMPERATURE},
+    }
+    config = resolve_manifest(manifest)
+    ok, _ = execute_run(config, "src/experiment_runner.py run <CONFIG.json>")
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":
