@@ -86,7 +86,7 @@ RANDOM_START = False
 MODEL_INPUT_SIZE = 448
 DEEPSEEK_IMAGE_TOKEN_ID = 128815
 DEEPSEEK_PATCH_SIZE = 16
-DEEPSEEK_DOWNSAMPLE_RATIO = 4
+DEEPSEEK_DOWNSAMPLE_RATIO = 5
 DEEPSEEK_NORMALIZE_MEAN = 0.5
 DEEPSEEK_NORMALIZE_STD = 0.5
 ENCODER_DECODER_FAMILIES = {"encoder_decoder_donut", "encoder_decoder_nougat"}
@@ -94,8 +94,8 @@ ENCODER_DECODER_FAMILIES = {"encoder_decoder_donut", "encoder_decoder_nougat"}
 REPO_ROOT = find_repo_root(Path(__file__).resolve())
 RESULTS_DIR = REPO_ROOT / "results"
 
-MODEL_KEY = "nougat"  # Options: "deepseek_ocr_2", "imgscope", "donut", "nougat"
-IMG_IDX = 1
+MODEL_KEY = "donut"  # Options: "deepseek_ocr_2", "imgscope", "donut", "nougat"
+IMG_IDX = 15  # Options: 0-15, corresponds to the image index in data/images/{IMG_IDX}.png
 SOURCE_IMAGE_PATH = REPO_ROOT / "data" / "images" / f"{IMG_IDX}.png"
 OUTPUT_ADV_PATH = RESULTS_DIR / f"{MODEL_KEY}_ocr_{NUM}_adv_{IMG_IDX}.png"
 
@@ -944,19 +944,25 @@ def run_pgd(
     teacher_forced_batch: dict[str, torch.Tensor],
     state: dict,
     x_clean: torch.Tensor,
+    *,
+    epsilon: float = EPSILON,
+    alpha: float = ALPHA,
+    steps: int = STEPS,
+    random_start: bool = RANDOM_START,
+    event_callback=None,
 ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
     delta = torch.zeros_like(x_clean, dtype=torch.float32)
-    if RANDOM_START:
-        delta.uniform_(-EPSILON, EPSILON)
-        project_delta(delta, x_clean, EPSILON)
+    if random_start:
+        delta.uniform_(-epsilon, epsilon)
+        project_delta(delta, x_clean, epsilon)
     delta.requires_grad_(True)
 
     # Guard against silent failures where quantization or preprocessing blocks gradient flow.
     saw_nonzero_grad = False
     last_loss = 0.0
     last_grad_inf = 0.0
-    progress = tqdm(range(STEPS))
-    for _ in progress:
+    progress = tqdm(range(steps))
+    for step_index in progress:
         if delta.grad is not None:
             delta.grad.zero_()
 
@@ -974,12 +980,19 @@ def run_pgd(
 
         with torch.no_grad():
             # PGD ascent on transcription loss, then project back into the L_inf epsilon ball.
-            delta.add_(ALPHA * grad.sign())
-            project_delta(delta, x_clean, EPSILON)
+            delta.add_(alpha * grad.sign())
+            project_delta(delta, x_clean, epsilon)
 
         last_loss = float(loss.item())
         last_grad_inf = grad_inf
         progress.set_postfix(loss=f"{last_loss:.4f}", grad_inf=f"{last_grad_inf:.6f}")
+        if event_callback is not None and (step_index == 0 or step_index == steps - 1 or (step_index + 1) % 10 == 0):
+            event_callback(
+                "optimization_metric",
+                step=step_index + 1,
+                loss=last_loss,
+                gradient_inf=last_grad_inf,
+            )
 
     if not saw_nonzero_grad:
         # Failing early here avoids writing artifacts from a no-op attack.
@@ -1049,7 +1062,7 @@ def build_report(
     return "\n".join(lines)
 
 
-def main() -> None:
+def _legacy_main() -> None:
     run_config = build_run_config()
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires CUDA.")
@@ -1345,6 +1358,351 @@ def main() -> None:
     print(f"Perturbation L_inf: {linf_delta:.6f}")
     print(f"Saved adversarial image to {run_config['output_adv_path'].resolve()}")
     print(f"Saved report to {run_config['output_report_path'].resolve()}")
+
+
+def _ocr_model_keys(config: dict) -> tuple[str, list[str]]:
+    selected = config.get("models", config.get("model_key"))
+    if isinstance(selected, str):
+        return selected, [selected]
+    if isinstance(selected, list):
+        if not selected:
+            raise ValueError("At least one OCR model must be selected.")
+        return selected[0], list(selected)
+    if isinstance(selected, dict):
+        attack_key = selected.get("attack")
+        transfer = selected.get("transfer", [])
+        if not isinstance(attack_key, str):
+            raise ValueError("OCR pipeline models.attack must be a model key.")
+        if isinstance(transfer, str):
+            transfer = [transfer]
+        if not isinstance(transfer, list):
+            raise ValueError("OCR pipeline models.transfer must be a list.")
+        return attack_key, [attack_key, *transfer]
+    raise ValueError("OCR models must be a model key, list, or pipeline object.")
+
+
+def _ocr_config_for_model(config: dict, model_key: str) -> dict:
+    model_definition = MODEL_CONFIGS[model_key]
+    model_config = dict(config)
+    model_config["model_key"] = model_key
+    model_config["model_name"] = model_definition["model_name"]
+    model_config["model_family"] = model_definition["model_family"]
+    model_config["ocr_prompt"] = (
+        config.get("prompt") if config.get("prompt") is not None else model_definition.get("ocr_prompt")
+    )
+    for key in ("base_size", "image_size", "crop_mode"):
+        if key in model_definition:
+            model_config[key] = model_definition[key]
+    model_config["model_input_size"] = int(config.get("model_input_size", MODEL_INPUT_SIZE))
+    return model_config
+
+
+def _load_ocr_runtime(config: dict, x_clean: torch.Tensor, event_callback=None) -> dict:
+    device = torch.device(config.get("device", "cuda:0"))
+    torch.cuda.set_device(device)
+    model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    source_image_path = Path(config["inputs"]["image"])
+    model_family = config["model_family"]
+    model_name = config["model_name"]
+    prompt = config.get("ocr_prompt")
+    if event_callback is not None:
+        event_callback("model_started", model_key=config["model_key"], model_name=model_name, device=str(device))
+
+    tokenizer = None
+    processor = None
+    prompt_model_inputs = {}
+    if model_family == "deepseek":
+        ensure_deepseek_transformers_compat()
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_safetensors=True,
+            torch_dtype=model_dtype,
+        ).to(device)
+        state = {
+            "device": device,
+            "dtype": model_dtype,
+            "model_family": model_family,
+            "prompt": prompt,
+            "base_size": int(config.get("base_size", 1024)),
+            "image_size": int(config.get("image_size", 768)),
+            "crop_mode": bool(config.get("crop_mode", True)),
+            "deepseek_layout": resolve_deepseek_layout(model),
+            "deepseek_crop_grid": resolve_deepseek_crop_grid(
+                int(x_clean.shape[-2]),
+                int(x_clean.shape[-1]),
+                crop_mode=bool(config.get("crop_mode", True)),
+                image_size=int(config.get("image_size", 768)),
+            ),
+        }
+        if state["deepseek_layout"] != "ocr2":
+            raise RuntimeError(f"Unsupported DeepSeek layout: {state['deepseek_layout']}")
+        prompt_text, prompt_model_inputs, prompt_image_mask = build_deepseek_prompt_inputs(tokenizer, state)
+        state["deepseek_prompt_image_mask"] = prompt_image_mask
+        prompt_token_count = prompt_model_inputs["input_ids"].shape[1]
+        patch_deepseek_forward(model)
+    elif model_family == "qianfan":
+        ensure_qianfan_transformers_support()
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModelForImageTextToText.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
+        image_processor = processor.image_processor
+        state = {
+            "device": device,
+            "dtype": model_dtype,
+            "model_family": model_family,
+            "image_processor": image_processor,
+            "min_patches": 1,
+            "max_patches": 12,
+        }
+        prompt_dummy_image_size = (int(x_clean.shape[-1]), int(x_clean.shape[-2]))
+    elif model_family == "hunyuan":
+        ensure_hunyuan_transformers_support()
+        processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        model = getattr(transformers, "HunYuanVLForConditionalGeneration").from_pretrained(
+            model_name, attn_implementation="eager", dtype=model_dtype
+        ).to(device)
+        image_processor = processor.image_processor
+        vision_config = model.config.vision_config
+        state = {
+            "device": device,
+            "dtype": model_dtype,
+            "model_family": model_family,
+            "min_pixels": int(getattr(image_processor, "min_pixels")),
+            "max_pixels": int(getattr(image_processor, "max_pixels")),
+            "patch_size": int(getattr(image_processor, "patch_size", vision_config.patch_size)),
+            "temporal_patch_size": int(getattr(image_processor, "temporal_patch_size", getattr(vision_config, "temporal_patch_size", 1))),
+            "merge_size": int(getattr(image_processor, "merge_size", vision_config.spatial_merge_size)),
+            "resize_mode": resolve_hunyuan_resize_mode(image_processor),
+            "mean": torch.tensor(image_processor.image_mean, device=device, dtype=torch.float32),
+            "std": torch.tensor(image_processor.image_std, device=device, dtype=torch.float32),
+        }
+        prompt_dummy_image_size = (int(x_clean.shape[-1]), int(x_clean.shape[-2]))
+    elif is_encoder_decoder_family(model_family):
+        if model_family == "encoder_decoder_nougat":
+            ensure_nougat_dependencies()
+            processor = NougatProcessor.from_pretrained(model_name, backend="torchvision")
+        else:
+            processor = DonutProcessor.from_pretrained(model_name, backend="torchvision", use_fast=False)
+        model = VisionEncoderDecoderModel.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
+        prompt_model_inputs = build_encoder_decoder_prompt_inputs(processor.tokenizer, prompt, device)
+        state = {
+            "device": device,
+            "dtype": model_dtype,
+            "model_family": model_family,
+            "image_processor": processor.image_processor,
+            **prompt_model_inputs,
+        }
+    else:
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name, trust_remote_code=True, torch_dtype=model_dtype
+        ).to(device)
+        vision_config = model.config.vision_config
+        state = {
+            "device": device,
+            "dtype": model_dtype,
+            "model_family": model_family,
+            "model_input_size": int(config.get("model_input_size", MODEL_INPUT_SIZE)),
+            "patch_size": vision_config.patch_size,
+            "temporal_patch_size": vision_config.temporal_patch_size,
+            "merge_size": vision_config.spatial_merge_size,
+            "mean": torch.tensor(processor.image_processor.image_mean, device=device, dtype=torch.float32),
+            "std": torch.tensor(processor.image_processor.image_std, device=device, dtype=torch.float32),
+        }
+        prompt_dummy_image_size = (state["model_input_size"], state["model_input_size"])
+
+    model.eval()
+    model.requires_grad_(False)
+    if model_family != "deepseek" and not is_encoder_decoder_family(model_family):
+        prompt_text, prompt_model_inputs = build_chat_prompt_inputs(
+            processor, device, prompt, prompt_dummy_image_size
+        )
+        if model_family == "hunyuan":
+            validate_hunyuan_preprocessing(
+                processor, prompt_text, prompt_model_inputs, state, source_image_path, x_clean
+            )
+        prompt_token_count = prompt_model_inputs["input_ids"].shape[1]
+
+    clean_vision_inputs = build_model_vision_inputs(state, x_clean.squeeze(0))
+    if model_family == "deepseek":
+        validate_deepseek_image_token_alignment(state, clean_vision_inputs)
+    if model_family == "qianfan":
+        expected = count_qianfan_prompt_image_patches(prompt_model_inputs, processor)
+        actual = int(clean_vision_inputs["pixel_values"].shape[0])
+        if expected != actual:
+            raise RuntimeError(f"Qianfan prompt/image patch count mismatch: prompt expects {expected}, manual preprocessing produced {actual}.")
+    return {
+        "config": config,
+        "model": model,
+        "processor": processor,
+        "tokenizer": tokenizer,
+        "state": state,
+        "prompt_model_inputs": prompt_model_inputs,
+        "prompt_token_count": prompt_token_count,
+        "device": device,
+    }
+
+
+def _generate_ocr_text(runtime: dict, image_tensor: torch.Tensor, max_new_tokens: int) -> str:
+    state = runtime["state"]
+    vision_inputs = build_model_vision_inputs(state, image_tensor.squeeze(0))
+    with torch.no_grad():
+        if state["model_family"] == "deepseek":
+            return generate_deepseek_text(
+                runtime["model"], runtime["tokenizer"], runtime["prompt_model_inputs"], runtime["prompt_token_count"], vision_inputs, max_new_tokens=max_new_tokens
+            )
+        if is_encoder_decoder_family(state["model_family"]):
+            return generate_encoder_decoder_text(
+                runtime["model"], runtime["processor"], state, vision_inputs, max_new_tokens=max_new_tokens
+            )
+        return generate_greedy_text(
+            runtime["model"], runtime["processor"], runtime["prompt_model_inputs"], runtime["prompt_token_count"], vision_inputs, max_new_tokens=max_new_tokens
+        )
+
+
+def _run_one_ocr_inference(config: dict, model_key: str, image_paths: dict[str, Path], event_callback=None) -> dict:
+    model_config = _ocr_config_for_model(config, model_key)
+    device = torch.device(model_config.get("device", "cuda:0"))
+    tensors = {key: load_image_tensor(path, device) for key, path in image_paths.items()}
+    runtime = _load_ocr_runtime(model_config, tensors["image"], event_callback)
+    outputs = {key: _generate_ocr_text(runtime, tensor, int(config["generation"]["max_new_tokens"])) for key, tensor in tensors.items()}
+    if event_callback is not None:
+        event_callback("model_completed", model_key=model_key, output_lengths={key: len(value) for key, value in outputs.items()})
+    return outputs
+
+
+def _selected_ocr_inference_keys(config: dict) -> list[str]:
+    _, keys = _ocr_model_keys(config)
+    if isinstance(config.get("models"), dict):
+        transfer = config["models"].get("transfer", [])
+        return [transfer] if isinstance(transfer, str) else list(transfer)
+    return keys
+
+
+def run_ocr_inference(config: dict, event_callback=None) -> dict:
+    image_paths = {"image": Path(config["inputs"]["image"])}
+    for field in ("clean", "adversarial"):
+        if field in config["inputs"]:
+            image_paths[field] = Path(config["inputs"][field])
+    outputs = {}
+    errors = []
+    for model_key in _selected_ocr_inference_keys(config):
+        try:
+            outputs[model_key] = _run_one_ocr_inference(config, model_key, image_paths, event_callback)
+        except Exception as exc:
+            errors.append({"model_key": model_key, "type": type(exc).__name__, "message": str(exc)})
+            if event_callback is not None:
+                event_callback("error", stage="inference", model_key=model_key, message=str(exc))
+    metrics = {"models_requested": len(_selected_ocr_inference_keys(config)), "models_succeeded": len(outputs)}
+    if "clean" in image_paths and "adversarial" in image_paths:
+        metrics["textual_change_metrics_are_behavioral"] = True
+        metrics["per_model_transcription_changes"] = {}
+        for model_key, model_outputs in outputs.items():
+            clean_text = model_outputs.get("clean", "")
+            adversarial_text = model_outputs.get("adversarial", "")
+            distance = levenshtein_distance(clean_text, adversarial_text)
+            metrics["per_model_transcription_changes"][model_key] = {
+                "exact_match": clean_text == adversarial_text,
+                "character_edit_distance": distance,
+                "character_edit_rate": distance / max(1, len(clean_text)),
+            }
+    return {"metrics": metrics, "raw_outputs": outputs, "artifacts": {}, "errors": errors}
+
+
+def run_ocr_attack(config: dict, event_callback=None) -> dict:
+    attack_key, _ = _ocr_model_keys(config)
+    model_config = _ocr_config_for_model(config, attack_key)
+    device = torch.device(model_config.get("device", "cuda:0"))
+    seed = int(config.get("seed", 0))
+    torch.manual_seed(seed)
+    x_clean = load_image_tensor(Path(config["inputs"]["image"]), device)
+    runtime = _load_ocr_runtime(model_config, x_clean, event_callback)
+    if event_callback is not None:
+        event_callback("stage_started", stage="clean_evaluation")
+    clean_text = _generate_ocr_text(runtime, x_clean, int(config["generation"]["max_new_tokens"]))
+    if not clean_text:
+        raise RuntimeError("Clean OCR transcript was empty.")
+    if is_encoder_decoder_family(runtime["state"]["model_family"]):
+        teacher_forced_batch = build_encoder_decoder_teacher_forced_batch(
+            runtime["processor"].tokenizer, runtime["prompt_model_inputs"], clean_text, device
+        )
+    else:
+        teacher_forced_batch = build_teacher_forced_batch(
+            runtime["tokenizer"] if runtime["tokenizer"] is not None else runtime["processor"].tokenizer,
+            runtime["prompt_model_inputs"], clean_text, device
+        )
+    attack = config["attack"]
+    if event_callback is not None:
+        event_callback("stage_started", stage="optimization")
+    x_adv, delta, final_loss, final_grad_inf = run_pgd(
+        runtime["model"], teacher_forced_batch, runtime["state"], x_clean,
+        epsilon=float(attack["epsilon"]), alpha=float(attack["alpha"]), steps=int(attack["steps"]),
+        random_start=bool(attack["random_start"]), event_callback=event_callback,
+    )
+    adv_text = _generate_ocr_text(runtime, x_adv, int(config["generation"]["max_new_tokens"]))
+    if event_callback is not None:
+        event_callback("model_completed", model_key=attack_key, output_lengths={"clean": len(clean_text), "adversarial": len(adv_text)})
+    linf_delta = float(delta.abs().max().item())
+    artifact_dir = Path(config["_artifact_dir"])
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    adv_path = artifact_dir / "adversarial.png"
+    noise_path = artifact_dir / "perturbation.png"
+    save_image_tensor(x_adv, adv_path)
+    save_image_tensor(torch.clamp(delta.abs() * 10.0, 0.0, 1.0), noise_path)
+    edit_distance = levenshtein_distance(clean_text, adv_text)
+    metrics = {
+        "exact_match": clean_text == adv_text,
+        "character_edit_distance": edit_distance,
+        "character_edit_rate": edit_distance / max(1, len(clean_text)),
+        "source_attack_loss": final_loss,
+        "gradient_inf": final_grad_inf,
+        "gradient_norm": final_grad_inf,
+        "perturbation_inf": linf_delta,
+        "perturbation_norm": linf_delta,
+        "textual_change_metrics_are_behavioral": True,
+    }
+    return {
+        "metrics": metrics,
+        "raw_outputs": {"clean": clean_text, "adversarial": adv_text},
+        "artifacts": {"adversarial_image": str(adv_path), "perturbation_visualization": str(noise_path)},
+        "errors": [],
+    }
+
+
+def run_ocr_pipeline(config: dict, event_callback=None) -> dict:
+    attack_result = run_ocr_attack(config, event_callback)
+    transfer_keys = _selected_ocr_inference_keys(config)
+    clean_path = Path(config["inputs"]["image"])
+    adv_path = Path(attack_result["artifacts"]["adversarial_image"])
+    transfer_config = dict(config)
+    transfer_config["inputs"] = {"image": str(clean_path), "clean": str(clean_path), "adversarial": str(adv_path)}
+    transfer_config["models"] = transfer_keys
+    transfer = run_ocr_inference(transfer_config, event_callback)
+    return {
+        "metrics": {**attack_result["metrics"], "transfer_models_succeeded": transfer["metrics"]["models_succeeded"]},
+        "raw_outputs": {"attack": attack_result["raw_outputs"], "transfer": transfer["raw_outputs"]},
+        "artifacts": attack_result["artifacts"],
+        "errors": transfer["errors"],
+    }
+
+
+def main() -> None:
+    from experiment_runner import execute_run
+    from workflow_contract import resolve_manifest
+
+    print("Canonical CLI: /home/jmadden2/anaconda3/envs/ocr/bin/python src/experiment_runner.py run <CONFIG.json>")
+    manifest = {
+        "schema_version": 1,
+        "name": f"legacy-ocr-{MODEL_KEY}-{IMG_IDX}",
+        "workflow": "ocr_attack",
+        "inputs": {"image": str(SOURCE_IMAGE_PATH)},
+        "models": MODEL_KEY,
+        "attack": {"epsilon": EPSILON, "alpha": ALPHA, "steps": STEPS, "random_start": RANDOM_START},
+    }
+    config = resolve_manifest(manifest)
+    ok, _ = execute_run(config, "src/experiment_runner.py run <CONFIG.json>")
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":
